@@ -1,4 +1,3 @@
-#first attempt at Idun connection and eye movement detection
 """
 AI Melody Composer - Pygame Game
 ABABCB song structure builder using fine-tuned Magenta attention_rnn
@@ -9,6 +8,8 @@ Controls:
   SPACE       — replay current melodies
   ESC         — quit
 """
+from asyncio import streams
+
 from pylsl import StreamInlet, resolve_streams
 #from idun_guardian_sdk import GuardianClient
 import pygame
@@ -27,12 +28,17 @@ import numpy as np
 
 RECORDING_TIMER = 0
 
+#events needed becausepygame doesn't allow directly calling functions from another thread (eye tracker thread)- will avoid crash
+SELECT_EVENT = pygame.USEREVENT + 1
+LEFT_EVENT = pygame.USEREVENT + 2
+RIGHT_EVENT = pygame.USEREVENT + 3
+
 # ─────────────────────────────────────────────
 #  CONFIG — edit these to match your setup
 # ─────────────────────────────────────────────
 #CHECKPOINT_DIR   = r"C:/Users/adamc/MusicGenAI/melody_rnn_finetuned/ABBA_05_03_26/melody_rnn/logdir/run1" #FIND PATH
-CHECKPOINT_DIR   = r"C:/Users/179is/MusicGenAI/melody_rnn/logdir/run1" #FIND PATH
-OUTPUT_DIR       = r"C:/Users/179is/BCIMusic_Game/generated_melodies" #MAKE PATH
+CHECKPOINT_DIR   = r"C:/Users/179is/BCI-Music Project/Music761/ARIA/Checkpoints/ABBA/model.ckpt-11228.data-00000-of-00001" #FIND PATH
+OUTPUT_DIR       = r"C:/Users/179is/BCI-Music_Project/Generated_Melodies" #MAKE PATH
 HPARAMS          = "batch_size=64,rnn_layer_sizes=[64,64]"
 NUM_STEPS_R1     = 128        # ~20 seconds at 120bpm, 4/4
 NUM_STEPS_R2     = 256        # ~20 seconds at 120bpm, 4/4
@@ -526,6 +532,7 @@ def draw_spinner(surf, cx, cy, t, color=ACCENT_A, r=28):
 #   EYE CONTROLS
 #____________________________________________
 
+# for left eye movement 
 def left_move(state, midi):
     """move to left option"""
     #event.key == pygame.K_LEFT
@@ -533,7 +540,7 @@ def left_move(state, midi):
     midi.play(state.options[0].notes)
     state.playing_idx = 0
 
-
+#for right eye movement
 def right_move(state, midi): 
     """move to right option"""
     #event.key == pygame.K_RIGHT
@@ -544,265 +551,211 @@ def right_move(state, midi):
 #____________________________________________
 #   CALIBRATION
 #____________________________________________
+
+#to use between left and right looking
 def countdown(seconds=3):
     for i in range (seconds, 0, -1):
         print(f"{i}...", flush=True)
         time.sleep(1)
 
 def calibrate(inlet, num_samples):
-    """Collect 2 seconds of data, ask user to look left then right"""
-
+    
     print('Welcome to BCI-Music! First we will calibrate your right and left eye movements to control the game', flush=True)
     time.sleep(4)
-    print('Left calibration beginning in', flush = True)
-    countdown(5)
-    print("Calibration: look LEFT now...", flush=True)
-    left_samples = []
-    for _ in range(num_samples):  # 5 seconds
-        sample, _ = inlet.pull_sample()
-        left_samples.append(sample[0])
-    
-    print('Left calibration complete. Right calibration beginning in', flush = True)
-    countdown(5)
+
+    #for normalization, collect neutral baseline dat
+    print('First, look straight ahead to establish baseline', flush=True)
+    countdown(5) #countdown to give user time to get ready and look straight ahead for neutral baseline collection
+    while True: #buffer is full of old data, so we pull with timeout until it's empty to start fresh
+        sample, ts = inlet.pull_sample(timeout=0.0) #pull sample with timeout=0 so we can break out of loop when buffer is empty
+        if sample is None: #if no sample is returned, buffer is empty, so we can break
+            break
+    print("Stay neutral...", flush=True)
+    neutral_samples = [] #collect neutral samples to calculate baseline
+    for _ in range(num_samples): # this is where we collect the neutral baseline data to normalize against for the left and right samples
+        neutral_samples.append(sample[0])
+    neutral_baseline = np.median(neutral_samples) #use median to reduce impact of outliers/spikes in the signal but have also tried mean
+
+    # drain buffer because there may be some samples collected while we were processing the neutral baseline, so we pull with timeout until it's empty to start fresh for left calibration
     while True:
         sample, ts = inlet.pull_sample(timeout=0.0)
         if sample is None:
             break
 
+    # this is where we collect the left and right samples to find the peaks for each eye movement, which we will then normalize against the neutral baseline to get the actual movement signal that we can use for detection in the game
+    print('Left calibration beginning in', flush=True)
+    countdown(5)
+    while True:
+        sample, ts = inlet.pull_sample(timeout=0.0)
+        if sample is None:
+            break
+    print("Calibration: look LEFT now...", flush=True)
+    left_samples = []
+    for _ in range(num_samples):
+        sample, _ = inlet.pull_sample()
+        left_samples.append(sample[0])
+    print('Left calibration complete.\n', flush=True)
+
+    # drain buffer
+    while True:
+        sample, ts = inlet.pull_sample(timeout=0.0)
+        if sample is None:
+            break
+
+    # for right eye movement calibration, same process as left 
+    print('Right calibration beginning in', flush=True)
+    countdown(5)
+    while True:
+        sample, ts = inlet.pull_sample(timeout=0.0)
+        if sample is None:
+            break
     print("Calibration: look RIGHT now...", flush=True)
     right_samples = []
-    for _ in range(num_samples):  # 5 seconds
+    for _ in range(num_samples):
         sample, _ = inlet.pull_sample()
         right_samples.append(sample[0])
-    
-    print('Right calibration complete.')
-    time.sleep(5)
-    
-    left_peak = np.mean(left_samples)
-    print(left_peak)
+    print('Right calibration complete.\n', flush=True)
 
-    right_peak = np.mean(right_samples)
-    print(right_peak)
+    # take medians of collected samples then subtract the neutral baseline to get the actual movement peaks for left and right, which we will use for detection thresholds in the game
+    left_peak  = np.median(left_samples)  - neutral_baseline
+    right_peak = np.median(right_samples) - neutral_baseline
+    # threshold  = abs(left_peak - right_peak) * 0.7
 
-    # Set threshold at 70% of the peak difference
-    threshold = abs(right_peak - left_peak) * 0.7
-    print(f"Threshold set to: {threshold}", flush=True)
+    print(f"Neutral baseline:       {neutral_baseline:.2f}", flush=True)
+    print(f"Left  (normalized):     {left_peak:.2f}", flush=True)
+    print(f"Right (normalized):     {right_peak:.2f}", flush=True)
+    # print(f"Threshold set to:       {threshold:.2f}", flush=True)
     time.sleep(2)
-    print('Begin game play in...')
+    print('Begin game play in...', flush=True)
     countdown(5)
-    return threshold
-#____________________________________________
-#   IDUN CONNECTION
-#____________________________________________
-'''
-def start_eye_tracker(state, midi, select_option):
-    from collections import deque
 
-    # 1. Find stream
-    print("Looking for EEG stream...", flush=True)
-    streams = resolve_streams(wait_time=5.0)
-    if not streams:
-        print("No EEG stream found! Make sure run.cmd is running.", flush=True)
-        return
-    inlet = StreamInlet(streams[0])
-    print("EEG stream found!\n", flush=True)
+    return left_peak, right_peak
 
-    # 2. Calibrate on same inlet, raw samples
-    threshold, left_peak, right_peak = calibrate(inlet)
 
-    # 3. Determine which direction is positive and negative
-    if right_peak > left_peak:
-        right_threshold = threshold
-        left_threshold = -threshold
-    else:
-        right_threshold = -threshold
-        left_threshold = threshold
 
-    # 4. Set up rolling baseline buffer
-    BASELINE_WINDOW = 750  # 3 seconds at 250Hz
-    baseline_buffer = deque(maxlen=BASELINE_WINDOW)
+def start_eye_tracker(inlet, left_peak, right_peak):
+    ''' this function runs in a separate thread and continuously pulls samples from the LSL stream, 
+    applies the high pass filter, normalizes against the baseline, and checks for eye movement detections 
+    based on the calibrated peaks and thresholds. 
+    When it detects a left or right eye movement, it posts a 
+    pygame event that the main game loop can pick up to trigger the corresponding action.'''
 
-    # 5. Fill baseline buffer before detection starts
+
+    print("EEG stream found!\n", flush=True) #after eye tracker is called in main function and stream is already resolved
+
+    COOLDOWN = 1250  # 5 seconds at 250Hz before next detection
+    cooldown_counter = 0 #this counter is set to COOLDOWN when a detection occurs, and counts down each sample until it reaches 0, at which point detection can occur again. 
+    #This prevents multiple detections from a single eye movement due to signal noise or holding the movement for too long.
+
+    # Set up high pass filter - removed because wasn't working but can try again
+    # removes slow baseline drift from the signal
+    # def high_pass_filter(cutoff=0.5, fs=250, order=4):
+    #     nyq = fs / 2
+    #     normal_cutoff = cutoff / nyq
+    #     b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    #     zi = lfilter_zi(b, a)
+    #     return b, a, zi
+
+    # b, a, zi = high_pass_filter()
+    from collections import deque #deque is a double-ended queue that we can use as a rolling buffer to store the most recent samples for baseline calculation.
+    # We set a maxlen so it automatically discards old samples when new ones come in, which is good for real-time processing needs.
+
+    BASELINE_WINDOW = 750  # 3 seconds at 250Hz #this is the number of recent samples we keep to calculate a rolling baseline for normalization
+    baseline_buffer = deque(maxlen=BASELINE_WINDOW) # this buffer will hold the most recent samples to calculate a rolling baseline, which helps account for slow changes in the signal over time
+    #keeps the detection responsive to actual eye movements rather than drift.
+
+    # fill baseline before detection
     print("Collecting baseline...", flush=True)
     for _ in range(BASELINE_WINDOW):
         sample, _ = inlet.pull_sample()
         baseline_buffer.append(sample[0])
     print("Baseline collected!\n", flush=True)
 
-    # 6. Detection loop
-    COOLDOWN = 4000
-    cooldown_counter = 0
-    current_direction = None
-    direction_count = 0
+    # ---- Settle the filter ----
+    # the filter produces a large spike on the first few samples
+    # so we run 500 samples through it (2 seconds) before detection
+    # to let it stabilize
+    # print("Settling filter...", flush=True)
+    # for _ in range(500):
+    #     sample, _ = inlet.pull_sample()
+    #     _, zi = lfilter(b, a, [sample[0]], zi=zi)
+    # print("Ready!\n", flush=True)
 
+    # calculate detection thresholds based on the calibrated peaks for left and right eye movements.
+    # we use 70% of each peak as the detection threshold so the user doesn't need to make a full eye movement to trigger
+    left_threshold  = left_peak  * 0.7
+    right_threshold = right_peak * 0.7
+
+    # determine detection direction for each threshold since in brainviewer L and R are different than plotted raw eeg seen
+    # left/right peaks can be positive or negative, so we check which direction each peak went and set the detection accordingly
+    # if threshold is negative, signal needs to go below it
+    # if threshold is positive, signal needs to go above it
+    if left_threshold < 0:
+        left_direction = "below"
+    else:
+        left_direction = "above"
+
+    if right_threshold < 0:
+        right_direction = "below"
+    else:
+        right_direction = "above"
+
+    print(f"Left threshold:  {left_threshold:.2f} (detect when signal goes {left_direction})", flush=True)
+    print(f"Right threshold: {right_threshold:.2f} (detect when signal goes {right_direction})", flush=True)
     print("Starting detection...", flush=True)
+
+    # main detection loop with high pass filter and no rolling buffer
+    # while True:
+    #     # pull one sample from the LSL stream
+    #     sample, _ = inlet.pull_sample()
+    #     value = sample[0]
+
+    #     # apply high pass filter to remove slow drift
+    #     # zi carries the filter state between samples so it works in real time
+    #     corrected, zi = lfilter(b, a, [value], zi=zi)
+    #     corrected = corrected[0]
+    # then in detection loop replace the filter lines with:
+
     while True:
-        sample, _ = inlet.pull_sample()
+        sample, _ = inlet.pull_sample() #this reacts to each new piece of data as it comes in rather than waiting for a full buffer to fill up
         value = sample[0]
 
-        # Apply rolling baseline subtraction
-        baseline = np.mean(baseline_buffer)
+        baseline = np.mean(baseline_buffer) #calculate the current baseline from the rolling buffer of recent samples, which helps account for slow changes in the signal over time
         corrected = value - baseline
-        baseline_buffer.append(value)
+        if cooldown_counter > 0: # if we're in cooldown period after a detection, we skip detection and just update the baseline buffer until cooldown is over
+                    cooldown_counter -= 1
+                    continue
 
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
 
-            # count samples that stay in same direction during cooldown
-            if current_direction == "right" and corrected < right_threshold:
-                direction_count += 1
-            elif current_direction == "left" and corrected > left_threshold:
-                direction_count += 1
+        baseline_buffer.append(value) # add the new sample to the baseline buffer for future baseline calculations, good for eye movement and not all drift
 
-            # at end of cooldown check if they held it
-            if cooldown_counter == 0:
-                if direction_count > COOLDOWN * 0.5:
-                    print(f"{current_direction} held — selecting!", flush=True)
-                    if current_direction == "right":
-                        pygame.event.post(pygame.event.Event(SELECT_EVENT, {"idx": 1}))
-                    elif current_direction == "left":
-                        pygame.event.post(pygame.event.Event(SELECT_EVENT, {"idx": 0}))
-                direction_count = 0
-                current_direction = None
-            continue
+        # ---- Detect left eye movement ----
+        # check above or below threshold depending on which direction
+        # left peak went during calibration
+        if left_direction == "below":
+            left_detected = corrected < left_threshold
+        else:
+            left_detected = corrected > left_threshold
 
-        if corrected > left_threshold:
+        # ---- Detect right eye movement ----
+        # same logic for right
+        if right_direction == "below":
+            right_detected = corrected < right_threshold
+        else:
+            right_detected = corrected > right_threshold
+
+        # post pygame events instead of calling functions directly
+        # because pygame functions can only be called from the main thread
+        # the main game loop picks these up and calls left_move/right_move safely
+        if left_detected:
             print("Left eye movement detected", flush=True)
             pygame.event.post(pygame.event.Event(LEFT_EVENT))
-            current_direction = "left"
-            direction_count = 0
             cooldown_counter = COOLDOWN
 
-        elif corrected < right_threshold:
+        elif right_detected:
             print("Right eye movement detected", flush=True)
             pygame.event.post(pygame.event.Event(RIGHT_EVENT))
-            current_direction = "right"
-            direction_count = 0
-            cooldown_counter = COOLDOWN 
-'''
-
-
-def start_eye_tracker(state, midi, threshold):
-    print("Looking for EEG stream...", flush=True)
-    streams = resolve_streams(wait_time=5.0)
-    inlet = StreamInlet(streams[0])
-    print("EEG stream found!", flush=True)
-
-    #  # Threshold for eye movement detection 
-    # THRESHOLD = threshold
-    # Minimum samples between detections to avoid repeated triggers
-    COOLDOWN = 5 #16 seconds based on length of sound
-    cooldown_counter = 0
-    
-    def high_pass_filter(cutoff= 0.5, fs=250, order = 4):
-        nyq = fs/2
-        normal_cutoff = cutoff/nyq
-        b, a = butter(order, normal_cutoff , btype= 'high', analog = False)
-        zi = lfilter_zi(b,a)
-        return b, a, zi
-    
-    b, a, zi = high_pass_filter()
-
-
-    while True:
-        sample, _ = inlet.pull_sample()
-        value = sample[0]
-
-        #highpass filter
-        corrected, zi = lfilter(b,a, [value], zi=zi)
-        corrected = corrected[0]
-
-        # Handle cooldown
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-            continue
-        
-        # if right_peak > left_peak:
-        #     right_threshold = threshold    # positive
-        #     left_threshold = -threshold    # negative
-        # else:
-        #     right_threshold = -threshold   # negative
-        #     left_threshold = threshold     # positive
-
-        # Detect eye movements
-        if corrected > threshold:
-            print("Right eye movement detected", flush=True)
-            right_move(state, midi)
             cooldown_counter = COOLDOWN
-            # if corrected > threshold:
-            #     print("Right option selected", flush=True)
-            #     select_option(1)
-            #     cooldown_counter = COOLDOWN
-
-        elif corrected < -threshold:
-            print("Left eye movement detected", flush=True)
-            left_move(state, midi)
-            cooldown_counter = COOLDOWN
-            # if corrected < -threshold:
-            #     print("Left option selected", flush=True)
-            #     select_option(0)
-            #     cooldown_counter = COOLDOWN
-
-        # elif -threshold < corrected < threshold:
-        #     print("Neutral eye movement. Please look right or left to select an option.", flush=True)
-        #     cooldown_counter = COOLDOWN
-
-# def start_eye_tracker(state, midi,b,a,zi, threshold):
-#     print("Looking for EEG stream...", flush=True)
-#     streams = resolve_streams(wait_time=5.0)
-#     inlet = StreamInlet(streams[0])
-#     # threshold, b, a, zi= calibrate(inlet, num_samples=250)
-#     print("EEG stream found!", flush=True)
-
-#     #  # Threshold for eye movement detection 
-#     # THRESHOLD = threshold
-#     # Minimum samples between detections to avoid repeated triggers
-#     COOLDOWN = 4000 #16 seconds based on length of sound
-#     cooldown_counter = 0
-#     current_direction = None
-#     direction_count = 0
-
-#     while True:
-#         sample, _ = inlet.pull_sample()
-#         value = sample[0]
-
-#         #highpass filter
-#         corrected, zi = lfilter(b,a, [value], zi=zi)
-#         corrected = corrected[0]
-
-#         # Handle cooldown
-#         if cooldown_counter > 0:
-#             cooldown_counter -= 1
-#             continue
-        
-
-#         # Detect eye movements
-#         if corrected > threshold:
-#             print("Right eye movement detected", flush=True)
-#             right_move(state, midi)
-#             # current_direction = "right"
-#             # direction_count = 0
-#             cooldown_counter = COOLDOWN
-#             # if corrected > threshold:
-#             #     print("Right option selected", flush=True)
-#             #     select_option(1)
-#             #     cooldown_counter = COOLDOWN
-
-#         elif corrected < -threshold:
-#             print("Left eye movement detected", flush=True)
-#             left_move(state, midi)
-#             # current_direction = "left"
-#             # direction_count = 0
-#             cooldown_counter = COOLDOWN
-#             # if corrected < -threshold:
-#             #     print("Left option selected", flush=True)
-#             #     select_option(0)
-#             #     cooldown_counter = COOLDOWN
-
-#         #elif -threshold < corrected < threshold:
-#          #   print("Neutral eye movement. Please look right or left to select an option.", flush=True)
-           
-    
 
 # ─────────────────────────────────────────────
 #  MAIN GAME
@@ -810,9 +763,10 @@ def start_eye_tracker(state, midi, threshold):
 
 def main():
 
-    streams = resolve_streams(wait_time=5.0)
-    inlet = StreamInlet(streams[0])
-    threshold= calibrate(inlet, num_samples= 1250) #5 seconds of listening
+    streams = resolve_streams(wait_time=5.0) #wait for up to 5 seconds to find an LSL stream. If no stream is found after 5 seconds, it will raise an error and exit, since the game relies on this data to function.
+    inlet = StreamInlet(streams[0]) #connect to first stream available
+    left_peak, right_peak = calibrate(inlet, num_samples= 1250) #5 seconds of listening at 250Hz to collect the samples for calibration
+   
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
@@ -914,9 +868,11 @@ def main():
             else:
                 start_generation()
 
+    #this thread runs the eye tracker in parallel to the main game loop, continuously listening for eye movement detections 
+    # and posting events when they occur, so the main loop can respond to them without blocking or missing any detections.
     idun_thread = threading.Thread(
         target=start_eye_tracker,
-        args=(state, midi, threshold),
+        args=(inlet,left_peak, right_peak),
         daemon=True
         )
     idun_thread.start()
@@ -957,6 +913,17 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == LEFT_EVENT: #adding as event type because pygame doesn't allow directly calling functions from another thread (eye tracker thread)
+                    if state.status == "choosing":
+                        left_move(state, midi)
+
+            elif event.type == RIGHT_EVENT: #adding as event type because pygame doesn't allow directly calling functions from another thread (eye tracker thread)
+                if state.status == "choosing":
+                    right_move(state, midi)
+
+            elif event.type == SELECT_EVENT:
+                if state.status == "choosing":
+                    select_option(event.idx)
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
@@ -968,7 +935,7 @@ def main():
                         left_move(state, midi)
                     #     midi.play(state.options[0].notes)
                     #     state.playing_idx = 0
-                    if event.key == pygame.K_RIGHT:
+                    elif event.key == pygame.K_RIGHT:
                         right_move(state, midi)
                         # midi.play(state.options[1].notes)
                         # state.playing_idx = 1
