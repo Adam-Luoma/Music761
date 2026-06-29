@@ -37,8 +37,8 @@ RIGHT_EVENT = pygame.USEREVENT + 3
 #  CONFIG — edit these to match your setup
 # ─────────────────────────────────────────────
 #CHECKPOINT_DIR   = r"C:/Users/adamc/MusicGenAI/melody_rnn_finetuned/ABBA_05_03_26/melody_rnn/logdir/run1" #FIND PATH
-CHECKPOINT_DIR   = r"C:/Users/179is/BCI-Music Project/Music761/ARIA/Checkpoints/ABBA/model.ckpt-11228.data-00000-of-00001" #FIND PATH
-OUTPUT_DIR       = r"C:/Users/179is/BCI-Music_Project/Generated_Melodies" #MAKE PATH
+CHECKPOINT_DIR   = r"C:\Users\179is\BCI-Music Project\Music761\ARIA\Checkpoints\model" #FIND PATH
+OUTPUT_DIR       = r"C:\Users\179is\BCI-Music Project\Music761\ARIA\Generated_Melodies"
 HPARAMS          = "batch_size=64,rnn_layer_sizes=[64,64]"
 NUM_STEPS_R1     = 128        # ~20 seconds at 120bpm, 4/4
 NUM_STEPS_R2     = 256        # ~20 seconds at 120bpm, 4/4
@@ -547,6 +547,16 @@ def right_move(state, midi):
     midi.play(state.options[1].notes)
     state.playing_idx = 1
 
+def baseline_correct(samples):
+    samples = np.array(samples)
+
+    if len(samples) == 0:
+        return samples
+
+    baseline = np.median(samples)
+    corrected = samples - baseline
+
+    return corrected
 
 #____________________________________________
 #   CALIBRATION
@@ -558,12 +568,13 @@ def countdown(seconds=3):
         print(f"{i}...", flush=True)
         time.sleep(1)
 
+
 def calibrate(inlet, num_samples):
     
     print('Welcome to BCI-Music! First we will calibrate your right and left eye movements to control the game', flush=True)
     time.sleep(4)
 
-    #for normalization, collect neutral baseline dat
+    #for normalization, collect neutral baseline data
     print('First, look straight ahead to establish baseline', flush=True)
     countdown(5) #countdown to give user time to get ready and look straight ahead for neutral baseline collection
     while True: #buffer is full of old data, so we pull with timeout until it's empty to start fresh
@@ -571,9 +582,15 @@ def calibrate(inlet, num_samples):
         if sample is None: #if no sample is returned, buffer is empty, so we can break
             break
     print("Stay neutral...", flush=True)
-    neutral_samples = [] #collect neutral samples to calculate baseline
-    for _ in range(num_samples): # this is where we collect the neutral baseline data to normalize against for the left and right samples
+    neutral_samples = []
+    for _ in range(num_samples):
+        sample, _ = inlet.pull_sample()
+        if sample is None:
+         continue  # skip this iteration, try again
         neutral_samples.append(sample[0])
+    # neutral_samples = [] #collect neutral samples to calculate baseline
+    # for _ in range(num_samples): # this is where we collect the neutral baseline data to normalize against for the left and right samples
+    #     neutral_samples.append(sample[0])
     neutral_baseline = np.median(neutral_samples) #use median to reduce impact of outliers/spikes in the signal but have also tried mean
 
     # drain buffer because there may be some samples collected while we were processing the neutral baseline, so we pull with timeout until it's empty to start fresh for left calibration
@@ -616,9 +633,15 @@ def calibrate(inlet, num_samples):
         right_samples.append(sample[0])
     print('Right calibration complete.\n', flush=True)
 
-    # take medians of collected samples then subtract the neutral baseline to get the actual movement peaks for left and right, which we will use for detection thresholds in the game
-    left_peak  = np.median(left_samples)  - neutral_baseline
-    right_peak = np.median(right_samples) - neutral_baseline
+    left_samples = np.array(left_samples) - neutral_baseline
+    right_samples = np.array(right_samples) - neutral_baseline
+
+    left_peak = np.median(left_samples)
+    right_peak = np.median(right_samples)
+
+    # # take medians of collected samples then subtract the neutral baseline to get the actual movement peaks for left and right, which we will use for detection thresholds in the game
+    # left_peak  = np.median(left_samples)  - neutral_baseline
+    # right_peak = np.median(right_samples) - neutral_baseline
     # threshold  = abs(left_peak - right_peak) * 0.7
 
     print(f"Neutral baseline:       {neutral_baseline:.2f}", flush=True)
@@ -723,6 +746,7 @@ def start_eye_tracker(inlet, left_peak, right_peak):
         baseline = np.mean(baseline_buffer) #calculate the current baseline from the rolling buffer of recent samples, which helps account for slow changes in the signal over time
         corrected = value - baseline
         if cooldown_counter > 0: # if we're in cooldown period after a detection, we skip detection and just update the baseline buffer until cooldown is over
+                    baseline_buffer.append(value)
                     cooldown_counter -= 1
                     continue
 
