@@ -1,0 +1,1499 @@
+"""
+BCI-Music Eye Onset Threshold Detector
+--------------------------------------
+
+This version does NOT use LDA.
+
+It:
+- receives EEG from the already-running IDUN LSL stream
+- creates an LSL marker stream called BCI_Controls
+- calibrates neutral, LEFT, and RIGHT eye movements using
+  MULTIPLE trials per direction (averaged for stability)
+- begins every LEFT/RIGHT calibration trial from straight-ahead gaze
+- gives the user enough time to react naturally
+- finds the actual eye-movement deflection after the cue
+- searches backward from the deflection to estimate movement onset
+- measures LEFT and RIGHT relative to the immediately preceding neutral baseline
+- continuously detects new LEFT / RIGHT onset deflections
+- publishes "LEFT" / "RIGHT" over the BCI_Controls LSL marker stream
+
+The detector responds to the CHANGE into an eye movement,
+rather than a gaze that is already being held.
+
+"""
+
+from collections import deque
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pylsl import (
+    StreamInlet,
+    StreamInfo,
+    StreamOutlet,
+    resolve_streams,
+)
+from scipy.signal import butter, lfilter, lfilter_zi
+
+
+# ============================================================
+# STREAM SETTINGS
+# ============================================================
+
+EEG_STREAM_TYPE = "EEG"
+
+CONTROL_STREAM_NAME = "IDUN_Stream"
+CONTROL_STREAM_TYPE = "Markers"
+CONTROL_SOURCE_ID = "bci_music_eye_controls"
+
+
+# ============================================================
+# SIGNAL SETTINGS
+# ============================================================
+
+SAMPLE_RATE = 250
+
+# Live detector window.
+ONSET_WINDOW_SAMPLES = 125          # 0.5 seconds
+
+# Calibration timings.
+BASELINE_SECONDS = 10.0              # straight-ahead baseline
+MOVEMENT_RECORDING_SECONDS = 10.0    # gives user time to react
+
+# How many LEFT / RIGHT trials to collect and average during calibration.
+CALIBRATION_TRIALS_PER_DIRECTION = 3
+
+# Original detector threshold settings.
+THRESHOLD_SCALE = 0.65
+
+# 1 second cooldown at 250 Hz.
+COOLDOWN_SAMPLES = 250
+
+NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
+PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots
+
+# ============================================================
+# GAZE STATE MACHINE SETTINGS
+# ============================================================
+
+GAZE_NEUTRAL = "NEUTRAL"
+GAZE_LEFT = "LEFT"
+GAZE_RIGHT = "RIGHT"
+
+MIN_AWAY_SAMPLES = int(0.50 * SAMPLE_RATE)
+RETURN_SETTLE_SAMPLES = int(0.40 * SAMPLE_RATE)
+
+# Calibration locks onto the FIRST meaningful departure from neutral
+# rather than the largest event anywhere in the full movement recording.
+CALIBRATION_SEARCH_SECONDS = 3.0
+CALIBRATION_LOCK_SECONDS = 0.40
+CALIBRATION_DEPARTURE_MAD_MULTIPLIER = 4.0
+
+
+# ============================================================
+# FIND EEG STREAM
+# ============================================================
+
+def find_eeg_inlet(wait_time=5.0):
+    """
+    Look for an already-running LSL stream with type='EEG'
+    and create an inlet for receiving samples.
+    """
+
+    print("Looking for EEG stream...", flush=True)
+
+    streams = resolve_streams(wait_time=wait_time)
+
+    eeg_streams = [
+        s for s in streams
+        if s.type() == EEG_STREAM_TYPE
+    ]
+
+    if not eeg_streams:
+
+        available = ", ".join(
+            f"{s.name()} [{s.type()}]"
+            for s in streams
+        ) or "none"
+
+        raise RuntimeError(
+            "No LSL stream with type='EEG' was found. "
+            "Start the IDUN streaming program first. "
+            f"Available streams: {available}"
+        )
+
+    stream = eeg_streams[0]
+
+    print(
+        f"EEG stream found: {stream.name()} "
+        f"({stream.channel_count()} channel(s), "
+        f"{stream.nominal_srate():.0f} Hz)\n",
+        flush=True,
+    )
+
+    return StreamInlet(stream)
+
+
+# ============================================================
+# CREATE OUTPUT CONTROL STREAM
+# ============================================================
+
+def create_control_outlet():
+    """
+    Create an LSL marker stream that sends:
+
+        LEFT
+        RIGHT
+
+    The game/application can listen to this stream.
+    """
+
+    info = StreamInfo(
+        CONTROL_STREAM_NAME,
+        CONTROL_STREAM_TYPE,
+        1,
+        0,
+        "string",
+        CONTROL_SOURCE_ID,
+    )
+
+    outlet = StreamOutlet(info)
+
+    print(
+        f"BCI control stream started: "
+        f"{CONTROL_STREAM_NAME}\n",
+        flush=True,
+    )
+
+    return outlet
+
+
+# ============================================================
+# HIGH-PASS FILTER
+# ============================================================
+
+def make_highpass_filter(
+    cutoff=0.5,
+    fs=SAMPLE_RATE,
+    order=2,
+):
+    """
+    Create a stateful high-pass filter.
+
+    The filter state is preserved between samples so filtering
+    behaves continuously.
+    """
+
+    nyquist = fs / 2
+    normal_cutoff = cutoff / nyquist
+
+    b, a = butter(
+        order,
+        normal_cutoff,
+        btype="highpass",
+    )
+
+    zi = lfilter_zi(b, a)
+
+    return b, a, zi
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def countdown(seconds=3):
+    """
+    Print a simple countdown.
+    """
+
+    for i in range(seconds, 0, -1):
+        print(f"{i}...", flush=True)
+        time.sleep(1)
+
+
+def drain_buffer(inlet):
+    """
+    Remove samples currently waiting in the LSL inlet.
+
+    This keeps old samples from accidentally becoming part
+    of the next trial.
+    """
+
+    while True:
+
+        sample, _ = inlet.pull_sample(
+            timeout=0.0
+        )
+
+        if sample is None:
+            break
+
+
+# ============================================================
+# FILTERED SAMPLE COLLECTION
+# ============================================================
+
+def collect_filtered_samples(
+    inlet,
+    num_samples,
+    hp_filter,
+):
+    """
+    Collect a fixed number of EEG samples.
+
+    Returns:
+        raw_samples
+        filtered_samples
+        updated hp_filter
+    """
+
+    raw_samples = []
+    filtered_samples = []
+
+    b, a, zi = hp_filter
+
+    while len(filtered_samples) < num_samples:
+
+        sample, _ = inlet.pull_sample(
+            timeout=1.0
+        )
+
+        if sample is None:
+            continue
+
+        raw_value = sample[0]
+
+        filtered, zi = lfilter(
+            b,
+            a,
+            [raw_value],
+            zi=zi,
+        )
+
+        raw_samples.append(raw_value)
+        filtered_samples.append(filtered[0])
+
+    return (
+        np.asarray(raw_samples),
+        np.asarray(filtered_samples),
+        (b, a, zi),
+    )
+
+
+# ============================================================
+# BASIC ONSET MEASUREMENT
+# ============================================================
+
+def onset_measurement(window):
+    """
+    Measure the strongest signed deflection in a window.
+
+    The first portion of the window acts as a local reference.
+
+    Returns:
+        signed_peak
+        positive_peak
+        negative_peak
+    """
+
+    window = np.asarray(
+        window,
+        dtype=float,
+    )
+
+    if len(window) < 5:
+        raise ValueError(
+            "Onset window is too short."
+        )
+
+    # Use first 20% as the local reference.
+    reference_samples = max(
+        5,
+        int(0.20 * len(window)),
+    )
+
+    reference = np.median(
+        window[:reference_samples]
+    )
+
+    relative = (
+        window - reference
+    )
+
+    positive_peak = np.max(relative)
+    negative_peak = np.min(relative)
+
+    # Keep the sign of whichever deflection is larger.
+    if abs(positive_peak) >= abs(negative_peak):
+        signed_peak = positive_peak
+    else:
+        signed_peak = negative_peak
+
+    return (
+        signed_peak,
+        positive_peak,
+        negative_peak,
+    )
+
+
+# ============================================================
+# SHARED STREAMING STEP (used by BOTH calibration and live detection)
+# ============================================================
+
+def streaming_onset_step(
+    value,
+    onset_buffer,
+    neutral_buffer,
+):
+    """
+    Advance the online detector by exactly one sample.
+
+    This is the single shared implementation of "rolling-neutral
+    baseline correction + windowed onset measurement." Both
+    run_detector (live) and calibration (via
+    replay_trial_through_streaming_detector below) call this same
+    function, sample by sample. Nothing about it differs between
+    calibration and live use.
+
+    This matters because a threshold is only meaningful if it's
+    compared against the same statistic it was derived from. Using
+    one function in both places guarantees that -- there's no
+    separate offline algorithm that calibration uses instead, whose
+    output has to be *assumed* to line up with what live detection
+    later computes.
+
+    Appending to neutral_buffer is left to the CALLER (not done in
+    here), since whether a sample is safe to fold into the rolling
+    neutral baseline is a decision that depends on context (was a
+    movement just detected? is this a known movement period during
+    calibration replay?) -- that decision differs between calibration
+    and live use, everything else does not.
+
+    Returns:
+        signed_peak, or None if onset_buffer isn't full yet.
+    """
+
+    neutral_baseline = (
+        np.median(neutral_buffer)
+        if len(neutral_buffer) > 0
+        else value
+    )
+
+    corrected_value = (
+        value
+        - neutral_baseline
+    )
+
+    onset_buffer.append(
+        corrected_value
+    )
+
+    if len(onset_buffer) < onset_buffer.maxlen:
+        return None
+
+    signed_peak, _, _ = onset_measurement(
+        onset_buffer
+    )
+
+    return signed_peak
+
+
+def replay_trial_through_streaming_detector(
+    baseline_filtered_samples,
+    movement_filtered_samples,
+):
+    """
+    Replay one calibration trial through the same streaming onset
+    calculation used during live detection.
+
+    Calibration locks onto the FIRST meaningful departure from NEUTRAL.
+    Once that departure is found, its direction is locked and only a short
+    same-direction peak window is considered. Later opposite return snaps
+    are ignored.
+    """
+
+    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)
+    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)
+
+    # Replay neutral baseline and collect the normal streaming-onset statistic.
+    baseline_signed_peaks = []
+
+    for value in baseline_filtered_samples:
+        signed_peak = streaming_onset_step(
+            value,
+            onset_buffer,
+            neutral_buffer,
+        )
+
+        if signed_peak is not None:
+            baseline_signed_peaks.append(float(signed_peak))
+
+        neutral_buffer.append(value)
+
+    # Robust departure threshold from neutral variation.
+    if baseline_signed_peaks:
+        baseline_abs = np.abs(
+            np.asarray(baseline_signed_peaks, dtype=float)
+        )
+
+        baseline_center = float(np.median(baseline_abs))
+        baseline_mad = float(
+            np.median(np.abs(baseline_abs - baseline_center))
+        )
+        robust_sigma = 1.4826 * baseline_mad
+
+        departure_threshold = (
+            baseline_center
+            + CALIBRATION_DEPARTURE_MAD_MULTIPLIER * robust_sigma
+        )
+    else:
+        departure_threshold = 0.0
+
+    departure_threshold = max(float(departure_threshold), 1e-6)
+
+    movement_signed_peaks = []
+
+    departure_index = None
+    locked_direction = None
+    locked_peak = None
+    peak_index = None
+    lock_end_index = None
+
+    search_samples = min(
+        len(movement_filtered_samples),
+        int(CALIBRATION_SEARCH_SECONDS * SAMPLE_RATE),
+    )
+
+    lock_samples = max(
+        1,
+        int(CALIBRATION_LOCK_SECONDS * SAMPLE_RATE),
+    )
+
+    # Replay movement with neutral baseline frozen.
+    for index, value in enumerate(movement_filtered_samples):
+        signed_peak = streaming_onset_step(
+            value,
+            onset_buffer,
+            neutral_buffer,
+        )
+
+        signed_value = 0.0 if signed_peak is None else float(signed_peak)
+        movement_signed_peaks.append(signed_value)
+
+        # Before departure: only search the early post-cue period.
+        if departure_index is None:
+            if index >= search_samples:
+                break
+
+            if (
+                signed_peak is not None
+                and abs(signed_value) >= departure_threshold
+            ):
+                departure_index = index
+                locked_direction = (
+                    "positive" if signed_value >= 0 else "negative"
+                )
+                locked_peak = signed_value
+                peak_index = index
+                lock_end_index = min(
+                    len(movement_filtered_samples) - 1,
+                    index + lock_samples,
+                )
+
+            continue
+
+        # After departure: only strengthen the same-direction onset.
+        same_direction = (
+            (locked_direction == "positive" and signed_value > 0)
+            or
+            (locked_direction == "negative" and signed_value < 0)
+        )
+
+        if (
+            same_direction
+            and abs(signed_value) > abs(locked_peak)
+        ):
+            locked_peak = signed_value
+            peak_index = index
+
+        if index >= lock_end_index:
+            break
+
+    movement_signed_peaks = np.asarray(
+        movement_signed_peaks,
+        dtype=float,
+    )
+
+    # Fallback: if no clear departure crossed the robust threshold,
+    # use the largest event only within the early search window.
+    if departure_index is None:
+        fallback_trace = movement_signed_peaks[:search_samples]
+
+        if len(fallback_trace) == 0:
+            raise RuntimeError(
+                "Calibration movement recording was empty."
+            )
+
+        peak_index = int(
+            np.argmax(np.abs(fallback_trace))
+        )
+        locked_peak = float(fallback_trace[peak_index])
+        departure_index = peak_index
+
+        print(
+            "WARNING: no clear first departure crossed the calibration "
+            "threshold; using the largest event in the early search window.",
+            flush=True,
+        )
+
+    return (
+        float(locked_peak),
+        int(peak_index),
+        movement_signed_peaks,
+        float(departure_threshold),
+        int(departure_index),
+    )
+
+
+# ============================================================
+# COLLECT ONE LEFT OR RIGHT CALIBRATION TRIAL
+# ============================================================
+
+def collect_single_movement_trial(
+    inlet,
+    direction_name,
+    trial_number,
+    total_trials,
+    hp_filter,
+):
+    """
+    Collect ONE LEFT or RIGHT movement trial.
+
+    The user first looks straight ahead.
+
+    Then:
+        LOOK LEFT / LOOK RIGHT
+
+    A long recording is collected so the user has enough time
+    to react naturally.
+
+    The recording is then replayed through the exact same
+    streaming detector used during live use (see
+    replay_trial_through_streaming_detector), so the peak this
+    trial reports is the peak live detection would actually see.
+    """
+
+    print(
+        "\n----------------------------------",
+        flush=True,
+    )
+
+    print(
+        f"{direction_name} CALIBRATION "
+        f"(trial {trial_number}/{total_trials})",
+        flush=True,
+    )
+
+    print(
+        "----------------------------------",
+        flush=True,
+    )
+
+    # ========================================================
+    # 1. USER STARTS FROM STRAIGHT AHEAD
+    # ========================================================
+
+    print(
+        "\nFirst, look STRAIGHT AHEAD.",
+        flush=True,
+    )
+
+    countdown(3)
+
+    drain_buffer(inlet)
+
+    print(
+        "Measuring straight-ahead baseline...",
+        flush=True,
+    )
+
+    baseline_num_samples = int(
+        BASELINE_SECONDS
+        * SAMPLE_RATE
+    )
+
+    baseline_raw_samples, baseline_samples, hp_filter = (
+        collect_filtered_samples(
+            inlet,
+            baseline_num_samples,
+            hp_filter,
+        )
+    )
+
+    # Median protects against occasional noisy samples.
+    baseline_value = float(
+        np.median(
+            baseline_samples
+        )
+    )
+
+    baseline_noise = float(
+        np.std(
+            baseline_samples
+        )
+    )
+
+    print(
+        f"Local baseline: {baseline_value:.2f}",
+        flush=True,
+    )
+
+    # ========================================================
+    # 2. GIVE MOVEMENT CUE
+    # ========================================================
+
+    print(
+        f"\nLOOK {direction_name} NOW!",
+        flush=True,
+    )
+
+    # ========================================================
+    # 3. RECORD LONG ENOUGH FOR NATURAL REACTION
+    # ========================================================
+
+    movement_num_samples = int(
+        MOVEMENT_RECORDING_SECONDS
+        * SAMPLE_RATE
+    )
+
+    movement_raw_samples, movement_samples, hp_filter = (
+        collect_filtered_samples(
+            inlet,
+            movement_num_samples,
+            hp_filter,
+        )
+    )
+
+    # ========================================================
+    # 4. REPLAY THIS TRIAL THROUGH THE SAME STREAMING DETECTOR
+    #    THAT LIVE DETECTION USES -- so the peak measured here
+    #    is the peak live detection will actually compute for
+    #    this movement, not an idealized offline estimate.
+    # ========================================================
+
+    (
+        signed_peak,
+        peak_index,
+        movement_signed_peaks,
+        departure_threshold,
+        departure_index,
+    ) = replay_trial_through_streaming_detector(
+        baseline_filtered_samples=baseline_samples,
+        movement_filtered_samples=movement_samples,
+    )
+
+    peak_time = (
+        peak_index
+        / SAMPLE_RATE
+    )
+
+    departure_time = (
+        departure_index
+        / SAMPLE_RATE
+    )
+
+    print(
+        f"\n{direction_name} trial {trial_number} "
+        f"first departure: {departure_time:.3f} s after cue",
+        flush=True,
+    )
+
+    print(
+        f"  locked streaming peak = {signed_peak:.2f} "
+        f"at {peak_time:.3f} s",
+        flush=True,
+    )
+
+    print(
+        f"  departure threshold = {departure_threshold:.2f}",
+        flush=True,
+    )
+
+    print(
+        f"  baseline noise SD = "
+        f"{baseline_noise:.2f}\n",
+        flush=True,
+    )
+
+    return {
+        "signed_peak": signed_peak,
+        "baseline_noise": baseline_noise,
+        "hp_filter": hp_filter,
+        "baseline_raw": baseline_raw_samples,
+        "baseline_filtered": baseline_samples,
+        "raw": movement_raw_samples,
+        "filtered": movement_samples,
+        "streaming_peaks": movement_signed_peaks,
+        "peak_index": peak_index,
+        "departure_index": departure_index,
+        "departure_threshold": departure_threshold,
+    }
+
+
+# ============================================================
+# COLLECT MULTIPLE TRIALS FOR ONE DIRECTION AND AGGREGATE
+# ============================================================
+
+def collect_movement_calibration(
+    inlet,
+    direction_name,
+    hp_filter,
+    num_trials=CALIBRATION_TRIALS_PER_DIRECTION,
+):
+    """
+    Collect several LEFT or RIGHT trials and aggregate them.
+
+    A single trial's amplitude is noisy -- one unusually big or
+    small saccade would otherwise set the threshold for the whole
+    session. Taking the median signed peak and noise across several
+    trials makes the calibration much less sensitive to any one
+    trial.
+
+    Returns:
+        aggregated_signed_peak (median across trials)
+        aggregated_baseline_noise (median across trials)
+        updated hp_filter
+        list of per-trial result dicts (for debug plotting)
+    """
+
+    trials = []
+
+    for trial_number in range(1, num_trials + 1):
+
+        trial = collect_single_movement_trial(
+            inlet=inlet,
+            direction_name=direction_name,
+            trial_number=trial_number,
+            total_trials=num_trials,
+            hp_filter=hp_filter,
+        )
+
+        hp_filter = trial["hp_filter"]
+
+        trials.append(trial)
+
+        if trial_number < num_trials:
+
+            print(
+                "Return eyes to center.",
+                flush=True,
+            )
+
+            time.sleep(1.5)
+
+            drain_buffer(inlet)
+
+    signed_peaks = [
+        trial["signed_peak"]
+        for trial in trials
+    ]
+
+    baseline_noises = [
+        trial["baseline_noise"]
+        for trial in trials
+    ]
+
+    aggregated_signed_peak = float(
+        np.median(signed_peaks)
+    )
+
+    aggregated_baseline_noise = float(
+        np.median(baseline_noises)
+    )
+
+    print(
+        f"{direction_name} aggregated over {num_trials} trials:",
+        flush=True,
+    )
+
+    print(
+        f"  per-trial signed peaks = "
+        f"{[round(p, 2) for p in signed_peaks]}",
+        flush=True,
+    )
+
+    print(
+        f"  median signed peak = "
+        f"{aggregated_signed_peak:.2f}\n",
+        flush=True,
+    )
+
+    return (
+        aggregated_signed_peak,
+        aggregated_baseline_noise,
+        hp_filter,
+        trials,
+    )
+
+
+def plot_calibration_debug(
+    left_trials,
+    right_trials,
+):
+    """
+    Overlay each LEFT/RIGHT trial's raw and filtered signal,
+    plus the streaming signed-peak trace that
+    replay_trial_through_streaming_detector produced for it --
+    i.e. the actual statistic live detection computes -- so
+    calibration quality and trial-to-trial consistency can be
+    checked visually.
+
+    A vertical line marks the largest streaming peak per trial
+    (this is what feeds the median used to set the threshold).
+    """
+
+    fig, axes = plt.subplots(
+        3,
+        2,
+        figsize=(14, 10),
+        sharex="col",
+    )
+
+    def plot_direction(trials, column, label):
+
+        for trial_index, trial in enumerate(trials):
+
+            raw_time_axis = (
+                np.arange(len(trial["raw"]))
+                / SAMPLE_RATE
+            )
+
+            streaming_time_axis = (
+                np.arange(len(trial["streaming_peaks"]))
+                / SAMPLE_RATE
+            )
+
+            trial_label = f"trial {trial_index + 1}"
+
+            axes[0, column].plot(
+                raw_time_axis,
+                trial["raw"],
+                label=trial_label,
+            )
+
+            axes[1, column].plot(
+                raw_time_axis,
+                trial["filtered"],
+                label=trial_label,
+            )
+
+            axes[2, column].plot(
+                streaming_time_axis,
+                trial["streaming_peaks"],
+                label=trial_label,
+            )
+
+            axes[2, column].axvline(
+                trial["departure_index"] / SAMPLE_RATE,
+                linestyle="--",
+                alpha=0.6,
+            )
+
+            axes[2, column].axvline(
+                trial["peak_index"] / SAMPLE_RATE,
+                linestyle=":",
+                alpha=0.6,
+            )
+
+        axes[0, column].set_title(f"{label} - Raw")
+        axes[1, column].set_title(f"{label} - High-pass filtered")
+        axes[2, column].set_title(f"{label} - Streaming signed peak")
+        axes[2, column].axhline(0, linestyle="--", color="black")
+        axes[2, column].set_xlabel("Time (s)")
+        axes[2, column].legend(fontsize=8)
+
+    plot_direction(left_trials, 0, "LEFT")
+    plot_direction(right_trials, 1, "RIGHT")
+
+    axes[0, 0].set_ylabel("Amplitude")
+    axes[1, 0].set_ylabel("Amplitude")
+    axes[2, 0].set_ylabel("Signed peak")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# FULL CALIBRATION
+# ============================================================
+
+def calibrate(inlet):
+    """
+    Calibration order:
+
+        1. STRAIGHT -> LEFT, repeated CALIBRATION_TRIALS_PER_DIRECTION times.
+        2. STRAIGHT -> RIGHT, repeated CALIBRATION_TRIALS_PER_DIRECTION times.
+
+    LEFT and RIGHT are measured relative to the immediately
+    preceding straight-ahead baseline, and each direction's final
+    threshold is based on the MEDIAN of several trials rather than
+    a single trial.
+
+    The user does NOT have to react instantly.
+    """
+
+    print(
+        "\n==================================",
+        flush=True,
+    )
+
+    print(
+        "BCI-MUSIC EYE CALIBRATION",
+        flush=True,
+    )
+
+    print(
+        "==================================\n",
+        flush=True,
+    )
+
+    print(
+        "For LEFT and RIGHT trials:",
+        flush=True,
+    )
+
+    print(
+        "1. Start by looking straight ahead.",
+        flush=True,
+    )
+
+    print(
+        "2. Wait for the movement cue.",
+        flush=True,
+    )
+
+    print(
+        "3. Move your eyes naturally when you see it.",
+        flush=True,
+    )
+
+    print(
+        f"You'll do {CALIBRATION_TRIALS_PER_DIRECTION} trials per "
+        f"direction. You do NOT need to react instantly.\n",
+        flush=True,
+    )
+
+    hp_filter = make_highpass_filter()
+
+    print(
+        "Warming up filter...",
+        flush=True,
+    )
+
+    _, _, hp_filter = collect_filtered_samples(
+        inlet,
+        SAMPLE_RATE * 2,   # 2 seconds
+        hp_filter,
+    )
+
+    print(
+        "Filter settled.\n",
+        flush=True,
+    )
+
+    # ========================================================
+    # PART 1: LEFT (multiple trials)
+    # ========================================================
+
+    (
+        left_peak,
+        _left_baseline_noise,
+        hp_filter,
+        left_trials,
+    ) = collect_movement_calibration(
+        inlet=inlet,
+        direction_name="LEFT",
+        hp_filter=hp_filter,
+    )
+
+    print(
+        "Return eyes to center.",
+        flush=True,
+    )
+
+    time.sleep(1.5)
+
+    drain_buffer(inlet)
+
+    # ========================================================
+    # PART 2: RIGHT (multiple trials)
+    # ========================================================
+
+    (
+        right_peak,
+        _right_baseline_noise,
+        hp_filter,
+        right_trials,
+    ) = collect_movement_calibration(
+        inlet=inlet,
+        direction_name="RIGHT",
+        hp_filter=hp_filter,
+    )
+
+    if PLOT_CALIBRATION_DEBUG:
+
+        plot_calibration_debug(
+            left_trials=left_trials,
+            right_trials=right_trials,
+        )
+
+    # ========================================================
+    # BUILD DETECTION THRESHOLDS
+    # ========================================================
+
+    left_direction = (
+        "positive"
+        if left_peak >= 0
+        else "negative"
+    )
+
+    right_direction = (
+        "positive"
+        if right_peak >= 0
+        else "negative"
+    )
+
+    left_threshold = float(
+        abs(left_peak) * THRESHOLD_SCALE
+    )
+
+    right_threshold = float(
+        abs(right_peak) * THRESHOLD_SCALE
+    )
+
+    # ========================================================
+    # PRINT RESULTS
+    # ========================================================
+
+    print(
+        "\n==================================",
+        flush=True,
+    )
+
+    print(
+        "CALIBRATION COMPLETE",
+        flush=True,
+    )
+
+    print(
+        "==================================",
+        flush=True,
+    )
+
+    print(
+        f"LEFT:",
+        flush=True,
+    )
+
+    print(
+        f"  direction = {left_direction}",
+        flush=True,
+    )
+
+    print(
+        f"  median peak = {left_peak:.2f}",
+        flush=True,
+    )
+
+    print(
+        f"  threshold = "
+        f"{left_threshold:.2f}",
+        flush=True,
+    )
+
+    print(
+        f"\nRIGHT:",
+        flush=True,
+    )
+
+    print(
+        f"  direction = {right_direction}",
+        flush=True,
+    )
+
+    print(
+        f"  median peak = {right_peak:.2f}",
+        flush=True,
+    )
+
+    print(
+        f"  threshold = "
+        f"{right_threshold:.2f}",
+        flush=True,
+    )
+
+    # ========================================================
+    # SANITY CHECKS
+    # ========================================================
+
+    if left_direction == right_direction:
+
+        print(
+            "\nWARNING:"
+            "\nLEFT and RIGHT produced the SAME "
+            "deflection direction."
+            "\nA single-channel, amplitude-based detector cannot "
+            "reliably tell direction apart in this case -- both "
+            "movements just look like 'bigger' or 'smaller' "
+            "versions of the same deflection. Threshold tuning "
+            "will not fix this on its own; it needs a different "
+            "signal feature (e.g. timing/shape) or won't be "
+            "reliably separable on a single in-ear channel.",
+            flush=True,
+        )
+
+    else:
+
+        print(
+            "\nGood: LEFT and RIGHT produced "
+            "opposite deflection directions.",
+            flush=True,
+        )
+
+    print()
+
+    # Return the filter too so live detection can continue
+    # with the same filter state instead of resetting it.
+    calibration = {
+        "left_direction": left_direction,
+        "right_direction": right_direction,
+        "left_threshold": left_threshold,
+        "right_threshold": right_threshold,
+    }
+
+    return (
+        calibration,
+        hp_filter,
+    )
+
+
+# ============================================================
+# THRESHOLD CHECK
+# ============================================================
+
+def threshold_crossed(
+    signed_peak,
+    direction,
+    threshold,
+):
+    """
+    Determine whether a signal crossed the calibrated threshold
+    in the expected direction.
+    """
+
+    if direction == "positive":
+
+        return (
+            signed_peak
+            >= threshold
+        )
+
+    return (
+        signed_peak
+        <= -threshold
+    )
+
+
+# ============================================================
+# LIVE DETECTION
+# ============================================================
+
+def run_detector(
+    inlet,
+    control_outlet,
+    calibration,
+    hp_filter,
+):
+    """
+    Detect gaze transitions with a three-state state machine.
+
+    Commands fire only when leaving NEUTRAL:
+        NEUTRAL -> LEFT   sends LEFT
+        NEUTRAL -> RIGHT  sends RIGHT
+
+    Return-to-centre transients do not fire commands:
+        LEFT  -> NEUTRAL  if a RIGHT-like return transient is seen
+        RIGHT -> NEUTRAL  if a LEFT-like return transient is seen
+
+    The rolling neutral baseline updates only while the gaze state is
+    NEUTRAL and settled.
+    """
+
+    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)
+    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)
+
+    gaze_state = GAZE_NEUTRAL
+    samples_in_away_state = 0
+    neutral_settle_counter = 0
+
+    print(
+        "Collecting rolling neutral baseline...",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Initial rolling neutral baseline.
+    # --------------------------------------------------------
+    while len(neutral_buffer) < NEUTRAL_WINDOW_SAMPLES:
+        sample, _ = inlet.pull_sample(timeout=1.0)
+
+        if sample is None:
+            continue
+
+        b, a, zi = hp_filter
+        filtered, zi = lfilter(
+            b,
+            a,
+            [sample[0]],
+            zi=zi,
+        )
+        hp_filter = (b, a, zi)
+
+        neutral_buffer.append(filtered[0])
+
+    print(
+        "Rolling neutral baseline collected.",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Fill initial onset buffer while neutral.
+    # --------------------------------------------------------
+    print(
+        "Collecting initial live window...",
+        flush=True,
+    )
+
+    while len(onset_buffer) < ONSET_WINDOW_SAMPLES:
+        sample, _ = inlet.pull_sample(timeout=1.0)
+
+        if sample is None:
+            continue
+
+        b, a, zi = hp_filter
+        filtered, zi = lfilter(
+            b,
+            a,
+            [sample[0]],
+            zi=zi,
+        )
+        hp_filter = (b, a, zi)
+
+        value = filtered[0]
+
+        streaming_onset_step(
+            value,
+            onset_buffer,
+            neutral_buffer,
+        )
+
+        neutral_buffer.append(value)
+
+    print(
+        "Starting onset threshold detection...",
+        flush=True,
+    )
+    print(
+        "Initial gaze state: NEUTRAL\n",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Live gaze-state machine.
+    # --------------------------------------------------------
+    while True:
+        sample, _ = inlet.pull_sample(timeout=1.0)
+
+        if sample is None:
+            continue
+
+        b, a, zi = hp_filter
+        filtered, zi = lfilter(
+            b,
+            a,
+            [sample[0]],
+            zi=zi,
+        )
+        hp_filter = (b, a, zi)
+
+        value = filtered[0]
+
+        signed_peak = streaming_onset_step(
+            value,
+            onset_buffer,
+            neutral_buffer,
+        )
+
+        if signed_peak is None:
+            continue
+
+        left_crossed = threshold_crossed(
+            signed_peak,
+            calibration["left_direction"],
+            calibration["left_threshold"],
+        )
+
+        right_crossed = threshold_crossed(
+            signed_peak,
+            calibration["right_direction"],
+            calibration["right_threshold"],
+        )
+
+        # Defensive tie-break if both somehow cross.
+        if left_crossed and right_crossed:
+            left_score = (
+                abs(signed_peak)
+                / calibration["left_threshold"]
+            )
+            right_score = (
+                abs(signed_peak)
+                / calibration["right_threshold"]
+            )
+
+            if left_score >= right_score:
+                right_crossed = False
+            else:
+                left_crossed = False
+
+        # ====================================================
+        # NEUTRAL: only state that can emit a command.
+        # ====================================================
+        if gaze_state == GAZE_NEUTRAL:
+            if neutral_settle_counter > 0:
+                neutral_settle_counter -= 1
+                continue
+
+            if left_crossed:
+                current_neutral = np.median(neutral_buffer)
+
+                print(
+                    f"NEUTRAL -> LEFT | "
+                    f"peak={signed_peak:.2f} "
+                    f"(neutral={current_neutral:.2f})",
+                    flush=True,
+                )
+
+                control_outlet.push_sample(["LEFT"])
+                gaze_state = GAZE_LEFT
+                samples_in_away_state = 0
+                continue
+
+            if right_crossed:
+                current_neutral = np.median(neutral_buffer)
+
+                print(
+                    f"NEUTRAL -> RIGHT | "
+                    f"peak={signed_peak:.2f} "
+                    f"(neutral={current_neutral:.2f})",
+                    flush=True,
+                )
+
+                control_outlet.push_sample(["RIGHT"])
+                gaze_state = GAZE_RIGHT
+                samples_in_away_state = 0
+                continue
+
+            # Safe neutral sample: adapt rolling baseline.
+            neutral_buffer.append(value)
+            continue
+
+        # ====================================================
+        # LEFT: opposite/right-like transient means return.
+        # Do NOT send RIGHT.
+        # ====================================================
+        if gaze_state == GAZE_LEFT:
+            samples_in_away_state += 1
+
+            if (
+                samples_in_away_state >= MIN_AWAY_SAMPLES
+                and right_crossed
+            ):
+                print(
+                    f"LEFT -> NEUTRAL | "
+                    f"return peak={signed_peak:.2f}",
+                    flush=True,
+                )
+
+                gaze_state = GAZE_NEUTRAL
+                samples_in_away_state = 0
+                neutral_settle_counter = RETURN_SETTLE_SAMPLES
+
+            # Freeze neutral baseline while gaze is away.
+            continue
+
+        # ====================================================
+        # RIGHT: opposite/left-like transient means return.
+        # Do NOT send LEFT.
+        # ====================================================
+        if gaze_state == GAZE_RIGHT:
+            samples_in_away_state += 1
+
+            if (
+                samples_in_away_state >= MIN_AWAY_SAMPLES
+                and left_crossed
+            ):
+                print(
+                    f"RIGHT -> NEUTRAL | "
+                    f"return peak={signed_peak:.2f}",
+                    flush=True,
+                )
+
+                gaze_state = GAZE_NEUTRAL
+                samples_in_away_state = 0
+                neutral_settle_counter = RETURN_SETTLE_SAMPLES
+
+            # Freeze neutral baseline while gaze is away.
+            continue
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    """
+    Full program order:
+
+        1. Start BCI_Controls output stream.
+        2. Find IDUN EEG stream.
+        3. Calibrate LEFT / RIGHT (multiple trials each).
+        4. Start continuous live detector.
+    """
+
+    control_outlet = (
+        create_control_outlet()
+    )
+
+    inlet = find_eeg_inlet(
+        wait_time=5.0
+    )
+
+    calibration, hp_filter = (
+        calibrate(inlet)
+    )
+
+    run_detector(
+        inlet=inlet,
+        control_outlet=control_outlet,
+        calibration=calibration,
+        hp_filter=hp_filter,
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    main()
