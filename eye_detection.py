@@ -1,10 +1,6 @@
 """
 BCI-Music Eye Onset Threshold Detector
 --------------------------------------
-
-This version does NOT use LDA.
-
-It:
 - receives EEG from the already-running IDUN LSL stream
 - creates an LSL marker stream called BCI_Controls
 - calibrates neutral, LEFT, and RIGHT eye movements using
@@ -70,7 +66,7 @@ THRESHOLD_SCALE = 0.65
 COOLDOWN_SAMPLES = 250
 
 NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
-PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots
+PLOT_CALIBRATION_DEBUG = False  # show calibration diagnostic plots
 
 # ============================================================
 # GAZE STATE MACHINE SETTINGS
@@ -80,7 +76,15 @@ GAZE_NEUTRAL = "NEUTRAL"
 GAZE_LEFT = "LEFT"
 GAZE_RIGHT = "RIGHT"
 
-MIN_AWAY_SAMPLES = int(0.50 * SAMPLE_RATE)
+# How long to ignore detection after a LEFT or RIGHT command.
+# This gives the user time to return their eyes to center.
+GAZE_HOLD_SECONDS = 10.0
+
+GAZE_HOLD_SAMPLES = int(
+    GAZE_HOLD_SECONDS * SAMPLE_RATE
+)
+
+#MIN_AWAY_SAMPLES = int(0.50 * SAMPLE_RATE)
 RETURN_SETTLE_SAMPLES = int(0.40 * SAMPLE_RATE)
 
 # Calibration locks onto the FIRST meaningful departure from neutral
@@ -1142,14 +1146,7 @@ def calibrate(inlet):
         print(
             "\nWARNING:"
             "\nLEFT and RIGHT produced the SAME "
-            "deflection direction."
-            "\nA single-channel, amplitude-based detector cannot "
-            "reliably tell direction apart in this case -- both "
-            "movements just look like 'bigger' or 'smaller' "
-            "versions of the same deflection. Threshold tuning "
-            "will not fix this on its own; it needs a different "
-            "signal feature (e.g. timing/shape) or won't be "
-            "reliably separable on a single in-ear channel.",
+            "deflection direction.",
             flush=True,
         )
 
@@ -1222,14 +1219,8 @@ def run_detector(
         NEUTRAL -> LEFT   sends LEFT
         NEUTRAL -> RIGHT  sends RIGHT
 
-    Return-to-centre transients do not fire commands:
-        LEFT  -> NEUTRAL  if a RIGHT-like return transient is seen
-        RIGHT -> NEUTRAL  if a LEFT-like return transient is seen
-
-    The rolling neutral baseline updates only while the gaze state is
-    NEUTRAL and settled.
     """
-
+        
     onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)
     neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)
 
@@ -1408,54 +1399,70 @@ def run_detector(
             neutral_buffer.append(value)
             continue
 
-        # ====================================================
-        # LEFT: opposite/right-like transient means return.
-        # Do NOT send RIGHT.
-        # ====================================================
+
+# LEFT:
+# Ignore ALL detections while the user returns to
+# center. After the hold period, automatically go
+# back to NEUTRAL.
+# ====================================================
+
         if gaze_state == GAZE_LEFT:
+
             samples_in_away_state += 1
 
-            if (
-                samples_in_away_state >= MIN_AWAY_SAMPLES
-                and right_crossed
-            ):
-                print(
-                    f"LEFT -> NEUTRAL | "
-                    f"return peak={signed_peak:.2f}",
+            if samples_in_away_state >= GAZE_HOLD_SAMPLES:
+
+                print( "neutral",
+                    # "LEFT -> NEUTRAL | "
+                    # "hold period complete",
                     flush=True,
                 )
 
                 gaze_state = GAZE_NEUTRAL
                 samples_in_away_state = 0
+
+                # Remove the LEFT movement and return-to-center
+                # transient from the onset history.
+                onset_buffer.clear()
+
+                # Briefly allow the signal to settle once neutral.
                 neutral_settle_counter = RETURN_SETTLE_SAMPLES
 
-            # Freeze neutral baseline while gaze is away.
+            # IMPORTANT:
+            # Ignore right_crossed, left_crossed, and all other
+            # detections while we are in the LEFT state.
             continue
 
-        # ====================================================
-        # RIGHT: opposite/left-like transient means return.
-        # Do NOT send LEFT.
-        # ====================================================
+# ====================================================
+# RIGHT:
+# Ignore ALL detections while the user returns to
+# center. After the hold period, automatically go
+# back to NEUTRAL.
+# ====================================================
+
         if gaze_state == GAZE_RIGHT:
+
             samples_in_away_state += 1
 
-            if (
-                samples_in_away_state >= MIN_AWAY_SAMPLES
-                and left_crossed
-            ):
-                print(
-                    f"RIGHT -> NEUTRAL | "
-                    f"return peak={signed_peak:.2f}",
+            if samples_in_away_state >= GAZE_HOLD_SAMPLES:
+
+                print( "neutral",
+                    # "RIGHT -> NEUTRAL | "
+                    # "hold period complete",
                     flush=True,
                 )
 
                 gaze_state = GAZE_NEUTRAL
                 samples_in_away_state = 0
+
+                # Remove the RIGHT movement and return-to-center
+                # transient from the onset history.
+                onset_buffer.clear()
+
                 neutral_settle_counter = RETURN_SETTLE_SAMPLES
 
-            # Freeze neutral baseline while gaze is away.
+            # Ignore every detection while in RIGHT.
             continue
-
 
 # ============================================================
 # MAIN
