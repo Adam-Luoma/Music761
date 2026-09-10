@@ -1,18 +1,6 @@
 """
-BCI-Music Eye Onset Threshold Detector
+BCI-Music Eye Movement Threshold Detector
 --------------------------------------
-- receives EEG from the already-running IDUN LSL stream
-- creates an LSL marker stream called BCI_Controls
-- calibrates neutral, LEFT, and RIGHT eye movements using
-  MULTIPLE trials per direction (averaged for stability)
-- begins every LEFT/RIGHT calibration trial from straight-ahead gaze
-- gives the user enough time to react naturally
-- finds the actual eye-movement deflection after the cue
-- searches backward from the deflection to estimate movement onset
-- measures LEFT and RIGHT relative to the immediately preceding neutral baseline
-- continuously detects new LEFT / RIGHT onset deflections
-- publishes "LEFT" / "RIGHT" over the BCI_Controls LSL marker stream
-
 The detector responds to the CHANGE into an eye movement,
 rather than a gaze that is already being held.
 
@@ -66,7 +54,7 @@ THRESHOLD_SCALE = 0.65
 COOLDOWN_SAMPLES = 250
 
 NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
-PLOT_CALIBRATION_DEBUG = False  # show calibration diagnostic plots
+PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots
 
 # ============================================================
 # GAZE STATE MACHINE SETTINGS
@@ -176,7 +164,7 @@ def create_control_outlet():
 # HIGH-PASS FILTER
 # ============================================================
 
-def make_highpass_filter(
+def make_highpass_filter(  #to be used on samples 
     cutoff=0.5,
     fs=SAMPLE_RATE,
     order=2,
@@ -199,7 +187,7 @@ def make_highpass_filter(
 
     zi = lfilter_zi(b, a)
 
-    return b, a, zi
+    return b, a, zi #this creates filter values
 
 
 # ============================================================
@@ -208,7 +196,7 @@ def make_highpass_filter(
 
 def countdown(seconds=3):
     """
-    Print a simple countdown.
+    Print a countdown to use before calibration.
     """
 
     for i in range(seconds, 0, -1):
@@ -221,7 +209,7 @@ def drain_buffer(inlet):
     Remove samples currently waiting in the LSL inlet.
 
     This keeps old samples from accidentally becoming part
-    of the next trial.
+    of the next trial. - the buffer is drained so movement is continuous
     """
 
     while True:
@@ -238,7 +226,7 @@ def drain_buffer(inlet):
 # FILTERED SAMPLE COLLECTION
 # ============================================================
 
-def collect_filtered_samples(
+def collect_filtered_samples(     # collected both raw and filtered samples
     inlet,
     num_samples,
     hp_filter,
@@ -252,12 +240,12 @@ def collect_filtered_samples(
         updated hp_filter
     """
 
-    raw_samples = []
-    filtered_samples = []
+    raw_samples = []          # empty list
+    filtered_samples = []      # empty list
 
-    b, a, zi = hp_filter
+    b, a, zi = hp_filter     # call filter
 
-    while len(filtered_samples) < num_samples:
+    while len(filtered_samples) < num_samples: # filtered sample length is less than the actual samples
 
         sample, _ = inlet.pull_sample(
             timeout=1.0
@@ -266,7 +254,7 @@ def collect_filtered_samples(
         if sample is None:
             continue
 
-        raw_value = sample[0]
+        raw_value = sample[0]  # raw value is straight from the collected inlet samples
 
         filtered, zi = lfilter(
             b,
@@ -279,7 +267,7 @@ def collect_filtered_samples(
         filtered_samples.append(filtered[0])
 
     return (
-        np.asarray(raw_samples),
+        np.asarray(raw_samples),    # return samples as array
         np.asarray(filtered_samples),
         (b, a, zi),
     )
@@ -289,44 +277,44 @@ def collect_filtered_samples(
 # BASIC ONSET MEASUREMENT
 # ============================================================
 
-def onset_measurement(window):
+def onset_measurement(window):   # where the signal is in the collection window
     """
     Measure the strongest signed deflection in a window.
 
-    The first portion of the window acts as a local reference.
+    The first portion of the window acts as a local reference since user doens't look immediately
 
     Returns:
         signed_peak
         positive_peak
-        negative_peak
+        negative_peak 
     """
 
-    window = np.asarray(
-        window,
+    window = np.asarray(  
+        window, 
         dtype=float,
     )
 
-    if len(window) < 5:
+    if len(window) < 5:  #less than 5 seconds because not enough time for baseline and deflection
         raise ValueError(
-            "Onset window is too short."
+            "Onset window is too short."      
         )
 
-    # Use first 20% as the local reference.
+    # Use first 20% as the local reference.- why? - so that only the beginning is the baseline
     reference_samples = max(
         5,
         int(0.20 * len(window)),
     )
 
     reference = np.median(
-        window[:reference_samples]
+        window[:reference_samples] # take the median sample as the baseline (could be the average?-would this be better)
     )
 
     relative = (
-        window - reference
+        window - reference  # relative is the difference between the window and the reference (baseline)  
     )
 
-    positive_peak = np.max(relative)
-    negative_peak = np.min(relative)
+    positive_peak = np.max(relative) # this is max deflection from the baseline
+    negative_peak = np.min(relative)  # min deflection from the baseline 
 
     # Keep the sign of whichever deflection is larger.
     if abs(positive_peak) >= abs(negative_peak):
@@ -342,7 +330,7 @@ def onset_measurement(window):
 
 
 # ============================================================
-# SHARED STREAMING STEP (used by BOTH calibration and live detection)
+# SHARED STREAMING STEP (used by calibration and live detection)
 # ============================================================
 
 def streaming_onset_step(
@@ -352,28 +340,6 @@ def streaming_onset_step(
 ):
     """
     Advance the online detector by exactly one sample.
-
-    This is the single shared implementation of "rolling-neutral
-    baseline correction + windowed onset measurement." Both
-    run_detector (live) and calibration (via
-    replay_trial_through_streaming_detector below) call this same
-    function, sample by sample. Nothing about it differs between
-    calibration and live use.
-
-    This matters because a threshold is only meaningful if it's
-    compared against the same statistic it was derived from. Using
-    one function in both places guarantees that -- there's no
-    separate offline algorithm that calibration uses instead, whose
-    output has to be *assumed* to line up with what live detection
-    later computes.
-
-    Appending to neutral_buffer is left to the CALLER (not done in
-    here), since whether a sample is safe to fold into the rolling
-    neutral baseline is a decision that depends on context (was a
-    movement just detected? is this a known movement period during
-    calibration replay?) -- that decision differs between calibration
-    and live use, everything else does not.
-
     Returns:
         signed_peak, or None if onset_buffer isn't full yet.
     """
@@ -417,8 +383,8 @@ def replay_trial_through_streaming_detector(
     are ignored.
     """
 
-    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)
-    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)
+    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)  # double check what the deque function can do
+    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES) 
 
     # Replay neutral baseline and collect the normal streaming-onset statistic.
     baseline_signed_peaks = []
@@ -1412,7 +1378,7 @@ def run_detector(
 
             if samples_in_away_state >= GAZE_HOLD_SAMPLES:
 
-                print( "neutral",
+                print( "Back to NEUTRAL",
                     # "LEFT -> NEUTRAL | "
                     # "hold period complete",
                     flush=True,
@@ -1446,7 +1412,7 @@ def run_detector(
 
             if samples_in_away_state >= GAZE_HOLD_SAMPLES:
 
-                print( "neutral",
+                print( "Back to NEUTRAL",
                     # "RIGHT -> NEUTRAL | "
                     # "hold period complete",
                     flush=True,
@@ -1481,6 +1447,7 @@ def main():
     control_outlet = (
         create_control_outlet()
     )
+
 
     inlet = find_eeg_inlet(
         wait_time=5.0

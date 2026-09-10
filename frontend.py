@@ -622,6 +622,7 @@ def main():
 
     midi = MidiPlayer()
     state = GameState()
+    
 
 
     # Animation state
