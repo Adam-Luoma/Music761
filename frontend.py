@@ -622,7 +622,8 @@ def main():
 
     midi = MidiPlayer()
     state = GameState()
-    
+    state.bci_pending_selection =None #None= nothing previewed yet
+    #LEFT = left has been previewed, RIGHT= right has been previewed
 
 
     # Animation state
@@ -675,6 +676,8 @@ def main():
 
     def select_option(idx):
         nonlocal feedback_msg, feedback_timer
+
+        state.bci_pending_selections = None #reset state
         opt = state.options[idx]
         if opt is None:
             return
@@ -748,10 +751,20 @@ def main():
 
             if state.status == "choosing":
                 if command == "LEFT":
-                    left_move(state, midi)
+                    if state.bci_pending_selection =="LEFT": #for second left, so selection
+                        select_option(0)
+                        state.bci_pending_selection =None
+                    else: #since state is none
+                        left_move(state, midi)
+                        state.bci_pending_selection = "LEFT"
 
-                elif command == "RIGHT":
-                    right_move(state, midi)
+                elif command == "RIGHT": # for second right so selection
+                    if state.bci_pending_selection =="RIGHT":
+                        select_option(1)
+                        state.bci_pending_selection =None
+                    else: #since state is none
+                        right_move(state, midi)
+                        state.bci_pending_selection = "RIGHT"
 
         # ── Events ──────────────────────────────────
         for event in pygame.event.get():
