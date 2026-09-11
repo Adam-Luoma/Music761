@@ -1,25 +1,17 @@
 """
-BCI-Music Pygame Application
-----------------------------
-
-This process contains the game/UI/music side only.
-
-It receives LEFT/RIGHT commands from eye_classifier.py through the
-BCI_Controls LSL marker stream.
-
-Recommended run order:
-    1. Start your existing IDUN -> LSL program
-    2. Run eye_classifier.py
-    3. Run this file
-"""
-
-"""
-AI Melody Composer - Pygame Game
+AI Melody Composer - Pygame Game controlled by eye movements
 ABABCB song structure builder using fine-tuned Magenta attention_rnn
+Works along side eye_detection.py for hands free selection
+
+
+File Run order:
+    1. Start existing IDUN -> LSL program (idun_pipe.exe) in command prompt
+    2. Run eye_deetection.py
+    3. Run this file (frontend.py)
 
 Controls:
-  LEFT ARROW  — select Melody A (left option)
-  RIGHT ARROW — select Melody B (right option)
+  LEFT ARROW/ LEFT EYE MOVEMENT — select Melody A (left option)
+  RIGHT ARROW/ RIGHT EYE MOVEMENT — select Melody B (right option)
   SPACE       — replay current melodies
   ESC         — quit
 """
@@ -38,13 +30,15 @@ import math
 from pathlib import Path
 
 
-RECORDING_TIMER = 0
+RECORDING_TIMER = 0 # necessary to avoid issues with eye detection and melody selection. 
+# It is used to ensure that the user has enough time to preview the melodies before making a selection. 
+# The timer is reset each time a new melody is generated or when the user makes a selection.
 
-# Custom event used internally by the Pygame application.
+# Custom event used internally by the Pygame application to show that melody selection is made with eye controls/keyboard
 SELECT_EVENT = pygame.USEREVENT + 1
 
 # ─────────────────────────────────────────────
-#  CONFIG — edit these to match your setup
+#  CONFIG 
 # ─────────────────────────────────────────────
 #CHECKPOINT_DIR   = r"C:/Users/adamc/MusicGenAI/melody_rnn_finetuned/ABBA_05_03_26/melody_rnn/logdir/run1" #FIND PATH
 CHECKPOINT_DIR   = r"C:\Users\179is\BCI-Music Project\Music761\ARIA\Checkpoints\model" #FIND PATH
@@ -562,7 +556,7 @@ def right_move(state, midi):
 
 
 # ─────────────────────────────────────────────
-#  BCI CONTROL STREAM
+#  IDUN CONTROL STREAM
 # ─────────────────────────────────────────────
 
 CONTROL_STREAM_NAME = "IDUN_Stream"
@@ -571,9 +565,9 @@ CONTROL_STREAM_TYPE = "Markers"
 
 def connect_to_control_stream(wait_time=10.0):
     """
-    Connect to the LEFT/RIGHT marker stream published by eye_classifier.py.
+    Connect to the LEFT/RIGHT marker stream published by eye_detection.py.
     """
-    print("Looking for BCI control stream...", flush=True)
+    print("Looking for IDUN control stream...", flush=True)
 
     streams = resolve_streams(wait_time=wait_time)
 
@@ -582,7 +576,7 @@ def connect_to_control_stream(wait_time=10.0):
             stream.name() == CONTROL_STREAM_NAME
             and stream.type() == CONTROL_STREAM_TYPE
         ):
-            print("BCI control stream found!\n", flush=True)
+            print("IDUN control stream found!\n", flush=True)
             return StreamInlet(stream)
 
     available = ", ".join(
@@ -591,7 +585,7 @@ def connect_to_control_stream(wait_time=10.0):
 
     raise RuntimeError(
         f"Could not find {CONTROL_STREAM_NAME}. "
-        "Run eye_classifier.py first. "
+        "Run eye_detection.py first. "
         f"Available streams: {available}"
     )
 
@@ -601,7 +595,7 @@ def connect_to_control_stream(wait_time=10.0):
 # ─────────────────────────────────────────────
 
 def main():
-    control_inlet = connect_to_control_stream(wait_time=10.0)
+    control_inlet = connect_to_control_stream(wait_time=10.0) # wait 10 secs to connect to stream
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
@@ -622,7 +616,8 @@ def main():
 
     midi = MidiPlayer()
     state = GameState()
-    state.bci_pending_selection =None #None= nothing previewed yet
+    state.bci_pending_selection =None  # neither left or right states activated yet
+    #None= nothing previewed yet
     #LEFT = left has been previewed, RIGHT= right has been previewed
 
 
@@ -677,7 +672,7 @@ def main():
     def select_option(idx):
         nonlocal feedback_msg, feedback_timer
 
-        state.bci_pending_selections = None #reset state
+        state.bci_pending_selections = None #reset state to be nothing yet
         opt = state.options[idx]
         if opt is None:
             return
@@ -739,7 +734,7 @@ def main():
         if feedback_timer > 0:
             feedback_timer -= 1
 
-        # ── BCI controls ────────────────────────────
+        # ── Eye movement controls ────────────────────────────
         # Read every queued LEFT/RIGHT command without blocking the GUI.
         while True:
             bci_sample, _ = control_inlet.pull_sample(timeout=0.0)
@@ -770,7 +765,7 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == SELECT_EVENT:
+            elif event.type == SELECT_EVENT: # event triggered by eye movement selection
                 if state.status == "choosing":
                     select_option(event.idx)
 
@@ -782,12 +777,8 @@ def main():
                     #pred_handler(event, state, midi)
                     if event.key == pygame.K_LEFT:
                         left_move(state, midi)
-                    #     midi.play(state.options[0].notes)
-                    #     state.playing_idx = 0
                     elif event.key == pygame.K_RIGHT:
                         right_move(state, midi)
-                        # midi.play(state.options[1].notes)
-                        # state.playing_idx = 1
                     elif event.key == pygame.K_RETURN or event.key == pygame.K_z:
                         select_option(0)
                     elif event.key == pygame.K_SLASH or event.key == pygame.K_x:
