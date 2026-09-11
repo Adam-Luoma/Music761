@@ -45,7 +45,7 @@ BASELINE_SECONDS = 10.0              # straight-ahead baseline
 MOVEMENT_RECORDING_SECONDS = 10.0    # gives user time to react
 
 # How many LEFT / RIGHT trials to collect and average during calibration.
-CALIBRATION_TRIALS_PER_DIRECTION = 3
+CALIBRATION_TRIALS_PER_DIRECTION = 3 #can change
 
 # Original detector threshold settings.
 THRESHOLD_SCALE = 0.65
@@ -54,7 +54,7 @@ THRESHOLD_SCALE = 0.65
 COOLDOWN_SAMPLES = 250
 
 NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
-PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots
+PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots, set to false for faster 
 
 # ============================================================
 # GAZE STATE MACHINE SETTINGS
@@ -66,7 +66,7 @@ GAZE_RIGHT = "RIGHT"
 
 # How long to ignore detection after a LEFT or RIGHT command.
 # This gives the user time to return their eyes to center.
-GAZE_HOLD_SECONDS = 10.0
+GAZE_HOLD_SECONDS = 10.0  #can change depending on user
 
 GAZE_HOLD_SAMPLES = int(
     GAZE_HOLD_SECONDS * SAMPLE_RATE
@@ -76,10 +76,12 @@ GAZE_HOLD_SAMPLES = int(
 RETURN_SETTLE_SAMPLES = int(0.40 * SAMPLE_RATE)
 
 # Calibration locks onto the FIRST meaningful departure from neutral
-# rather than the largest event anywhere in the full movement recording.
-CALIBRATION_SEARCH_SECONDS = 3.0
-CALIBRATION_LOCK_SECONDS = 0.40
-CALIBRATION_DEPARTURE_MAD_MULTIPLIER = 4.0
+# rather than the largest event anywhere in the full movement recording
+# so user just needs to lookin the correct direction once, can hold or not
+CALIBRATION_SEARCH_SECONDS = 3.0 # searches for movement in first 3 seconds
+CALIBRATION_LOCK_SECONDS = 0.40 # once movement detected, next .4 seconds used to find that peak so user doesn't have to sustain
+CALIBRATION_DEPARTURE_MAD_MULTIPLIER = 4.0 # this checks if the movement is significant enough to be considered a departure from neutral
+#if not then the largest movement in the first 3 seconds is used instead
 
 
 # ============================================================
@@ -137,7 +139,7 @@ def create_control_outlet():
         LEFT
         RIGHT
 
-    The game/application can listen to this stream.
+    The game/application (frontend.py) can listen to this stream.
     """
 
     info = StreamInfo(
@@ -330,48 +332,51 @@ def onset_measurement(window):   # where the signal is in the collection window
 
 
 # ============================================================
-# SHARED STREAMING STEP (used by calibration and live detection)
+# STREAMING (used by calibration and live detection)
 # ============================================================
 
 def streaming_onset_step(
-    value,
-    onset_buffer,
-    neutral_buffer,
+    value,  # newest sample coming in from headset
+    onset_buffer, # baseline corrected signal (rolling)
+    neutral_buffer, # neutral/straight ahead samplees (rolling) to use as basline or zero
 ):
     """
-    Advance the online detector by exactly one sample.
+    Advance the online detector by exactly one sample. Does not decide left vs right, 
+    but prepares and measures signal.
     Returns:
         signed_peak, or None if onset_buffer isn't full yet.
     """
 
-    neutral_baseline = (
-        np.median(neutral_buffer)
+    neutral_baseline = (   #calculate neutral baseline
+        np.median(neutral_buffer)   #take median of neutral baseline samples from neutral buffer
         if len(neutral_buffer) > 0
-        else value
+        else value  #if neutral buffer empty, use current sample for baseline
     )
 
-    corrected_value = (
+    corrected_value = ( # subtract neutral baseline from value to find how many units above neutral signal is
         value
         - neutral_baseline
+    )   #this moves neutral to zero no matter the value
+
+    onset_buffer.append(  #corrected samples is added to onset buffer
+        corrected_value   #value appened to window sliding along live signal
     )
 
-    onset_buffer.append(
-        corrected_value
-    )
-
-    if len(onset_buffer) < onset_buffer.maxlen:
+    if len(onset_buffer) < onset_buffer.maxlen: #checking whether enough samples collected before analyzing
         return None
 
-    signed_peak, _, _ = onset_measurement(
-        onset_buffer
+    signed_peak, _, _ = onset_measurement( #analyze compelted onset window once buffer is fill
+        onset_buffer  # this examines the window and determines onset deflection
     )
 
-    return signed_peak
+    return signed_peak  #send first result, give measurement back to dectector
 
 
-def replay_trial_through_streaming_detector(
-    baseline_filtered_samples,
-    movement_filtered_samples,
+# analysis step occuring inside calibration t ofind threshold and how large peaks have to be
+#from threshold to count
+def replay_trial_through_streaming_detector( #handles entire calibration trial
+    baseline_filtered_samples,  #where user is looking straight ahead
+    movement_filtered_samples, # where user looked after cue in calibration (L or R)
 ):
     """
     Replay one calibration trial through the same streaming onset
@@ -383,64 +388,72 @@ def replay_trial_through_streaming_detector(
     are ignored.
     """
 
-    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)  # double check what the deque function can do
-    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES) 
+    #create rolling buffers
+    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)  # deque is a list that holds recent correctd samples to calculate onset
+    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)  #hold recent neutral samples to estimate baseline
 
     # Replay neutral baseline and collect the normal streaming-onset statistic.
-    baseline_signed_peaks = []
+    baseline_signed_peaks = [] #store onset measurements from neutral gaze 
+    #to make sure normal movements aren't seen as eye movements
 
-    for value in baseline_filtered_samples:
-        signed_peak = streaming_onset_step(
+    for value in baseline_filtered_samples: #go through neutral recording one sample at a time, value becomes each sample one after another
+        signed_peak = streaming_onset_step( #taking pre recorded calibration signal as live
             value,
             onset_buffer,
             neutral_buffer,
         )
 
         if signed_peak is not None:
-            baseline_signed_peaks.append(float(signed_peak))
+            baseline_signed_peaks.append(float(signed_peak)) #once valid onset measurement exists save it
 
-        neutral_buffer.append(value)
+        neutral_buffer.append(value) # raw filtered neutral sample into neutral buffer show detector what current straight-ahead baseline looks like
 
-    # Robust departure threshold from neutral variation.
-    if baseline_signed_peaks:
+    # Robust departure threshold from neutral variation- how big a movement
+    # has to be to count
+    if baseline_signed_peaks: #if successfully collected neutral onset measurements, calculate threshold
         baseline_abs = np.abs(
-            np.asarray(baseline_signed_peaks, dtype=float)
+            np.asarray(baseline_signed_peaks, dtype=float) #remove signs to read how large normal noise is in neutral
         )
 
+        #find median size of neutral fluctuations
         baseline_center = float(np.median(baseline_abs))
-        baseline_mad = float(
-            np.median(np.abs(baseline_abs - baseline_center))
+        baseline_mad = float(  #median absolute deviation - like standard deviation
+            np.median(np.abs(baseline_abs - baseline_center)) #how spread out are the normal neutral values around typical neutral value
         )
-        robust_sigma = 1.4826 * baseline_mad
+        robust_sigma = 1.4826 * baseline_mad #convert median absolute deviation to standard deviation equivalent
+        #good so outliers don't mess up baseline threshold
 
-        departure_threshold = (
+        departure_threshold = ( #threshold = normal neutral level + safety margin
             baseline_center
             + CALIBRATION_DEPARTURE_MAD_MULTIPLIER * robust_sigma
         )
     else:
-        departure_threshold = 0.0
+        departure_threshold = 0.0 #if no baseline peaks
 
-    departure_threshold = max(float(departure_threshold), 1e-6)
+    departure_threshold = max(float(departure_threshold), 1e-6) #prevents threshold from actually being zero (always slightly positive)
 
-    movement_signed_peaks = []
+    movement_signed_peaks = [] #preparing to search for eye movements
 
-    departure_index = None
-    locked_direction = None
-    locked_peak = None
-    peak_index = None
-    lock_end_index = None
+    # start as empty since no movements yet
+    departure_index = None #where first meaningful movement occurs in the recording
+    locked_direction = None # what sign first movement is
+    locked_peak = None # strongest peak in that direction
+    peak_index = None # where strongest peak happened
+    lock_end_index = None # how long to look for strongest peak
 
-    search_samples = min(
+    search_samples = min(  # set how long to search for initial eye movements after cue
         len(movement_filtered_samples),
-        int(CALIBRATION_SEARCH_SECONDS * SAMPLE_RATE),
+        int(CALIBRATION_SEARCH_SECONDS * SAMPLE_RATE), #750 samples
     )
 
+    #how many samples examined after first departure
     lock_samples = max(
         1,
-        int(CALIBRATION_LOCK_SECONDS * SAMPLE_RATE),
+        int(CALIBRATION_LOCK_SECONDS * SAMPLE_RATE), #only look for 100 samples after first departure
     )
 
-    # Replay movement with neutral baseline frozen.
+    # Replay movement with neutral baseline frozen- does not update baseline with each movement so no new neutral
+    # than original one found from calibration
     for index, value in enumerate(movement_filtered_samples):
         signed_peak = streaming_onset_step(
             value,
@@ -448,46 +461,49 @@ def replay_trial_through_streaming_detector(
             neutral_buffer,
         )
 
+        #guarantees signed_valus is always a number
         signed_value = 0.0 if signed_peak is None else float(signed_peak)
         movement_signed_peaks.append(signed_value)
 
         # Before departure: only search the early post-cue period.
         if departure_index is None:
             if index >= search_samples:
-                break
+                break #If you've reached the end of your allowed search period without finding anything, stop searching.
 
+            #checking if valid onsent measurement and if larger than neutral noise
             if (
                 signed_peak is not None
                 and abs(signed_value) >= departure_threshold
             ):
-                departure_index = index
-                locked_direction = (
+                departure_index = index #save first meaningful departure
+                locked_direction = ( #detemine direction signal went (signal NOT eye direction)
                     "positive" if signed_value >= 0 else "negative"
                 )
-                locked_peak = signed_value
+                locked_peak = signed_value #first signal is best peak found
                 peak_index = index
-                lock_end_index = min(
-                    len(movement_filtered_samples) - 1,
+                lock_end_index = min( #creat ime windw after initial departure
+                    len(movement_filtered_samples) - 1, #can look for stronger same-direction peaks
                     index + lock_samples,
                 )
 
-            continue
+            continue #Move to next sample
 
         # After departure: only strengthen the same-direction onset.
-        same_direction = (
+        # prevents going back to neutral as being a direction change
+        same_direction = ( #is new value in same direction as OG movement
             (locked_direction == "positive" and signed_value > 0)
             or
             (locked_direction == "negative" and signed_value < 0)
         )
 
-        if (
+        if ( #if still pointing in same and stronger than previous peak, update peak
             same_direction
             and abs(signed_value) > abs(locked_peak)
         ):
             locked_peak = signed_value
-            peak_index = index
+            peak_index = index  #save new peak value
 
-        if index >= lock_end_index:
+        if index >= lock_end_index: #once short lock window finished, stop so calibration focuses on first eye movement
             break
 
     movement_signed_peaks = np.asarray(
@@ -505,11 +521,11 @@ def replay_trial_through_streaming_detector(
                 "Calibration movement recording was empty."
             )
 
-        peak_index = int(
+        peak_index = int( #finds largest absolute signal in early window
             np.argmax(np.abs(fallback_trace))
         )
         locked_peak = float(fallback_trace[peak_index])
-        departure_index = peak_index
+        departure_index = peak_index #use this event as calibration peak
 
         print(
             "WARNING: no clear first departure crossed the calibration "
@@ -518,11 +534,11 @@ def replay_trial_through_streaming_detector(
         )
 
     return (
-        float(locked_peak),
-        int(peak_index),
-        movement_signed_peaks,
-        float(departure_threshold),
-        int(departure_index),
+        float(locked_peak), #How storn detected eye movement was and if +/-
+        int(peak_index), # what sample the strongest onset/peak happened
+        movement_signed_peaks, # whole detector output trace during movement trial
+        float(departure_threshold), # how large a movement needed to be before counting as movement and not just noise
+        int(departure_index), #what sample signal first crossed thresholds
     )
 
 
@@ -531,11 +547,11 @@ def replay_trial_through_streaming_detector(
 # ============================================================
 
 def collect_single_movement_trial(
-    inlet,
-    direction_name,
-    trial_number,
-    total_trials,
-    hp_filter,
+    inlet, #where samples come from
+    direction_name, # L or R
+    trial_number, # which trial we are on
+    total_trials, 
+    hp_filter, 
 ):
     """
     Collect ONE LEFT or RIGHT movement trial.
@@ -549,8 +565,7 @@ def collect_single_movement_trial(
     to react naturally.
 
     The recording is then replayed through the exact same
-    streaming detector used during live use (see
-    replay_trial_through_streaming_detector), so the peak this
+    streaming detector used during live use (replay_trial_through_streaming_detector), so the peak this
     trial reports is the peak live detection would actually see.
     """
 
@@ -581,18 +596,21 @@ def collect_single_movement_trial(
 
     countdown(3)
 
-    drain_buffer(inlet)
+    drain_buffer(inlet) #throws away samples already in LSL buffer
 
     print(
         "Measuring straight-ahead baseline...",
         flush=True,
     )
 
+    # decide how many baseline samples to record
+    #converts samples into seconds
     baseline_num_samples = int(
         BASELINE_SECONDS
         * SAMPLE_RATE
     )
 
+    #collect samples- raw eeg values, hp filtered eeg values, and updated filter state
     baseline_raw_samples, baseline_samples, hp_filter = (
         collect_filtered_samples(
             inlet,
@@ -602,12 +620,14 @@ def collect_single_movement_trial(
     )
 
     # Median protects against occasional noisy samples.
+    #find typical baseline 
     baseline_value = float(
         np.median(
             baseline_samples
         )
     )
 
+    #how much signal moved while user was in neutral, good for calibration quality
     baseline_noise = float(
         np.std(
             baseline_samples
@@ -637,6 +657,7 @@ def collect_single_movement_trial(
         * SAMPLE_RATE
     )
 
+    #record eye movement samples- first part of signal represents eye movement
     movement_raw_samples, movement_samples, hp_filter = (
         collect_filtered_samples(
             inlet,
@@ -647,27 +668,28 @@ def collect_single_movement_trial(
 
     # ========================================================
     # 4. REPLAY THIS TRIAL THROUGH THE SAME STREAMING DETECTOR
-    #    THAT LIVE DETECTION USES -- so the peak measured here
-    #    is the peak live detection will actually compute for
-    #    this movement, not an idealized offline estimate.
+    #    THAT LIVE DETECTION USES 
     # ========================================================
-
+    #the peak measured here is the peak live detection will actually compute for
+    # this movement, not an idealized offline estimate
     (
         signed_peak,
         peak_index,
         movement_signed_peaks,
         departure_threshold,
         departure_index,
-    ) = replay_trial_through_streaming_detector(
+    ) = replay_trial_through_streaming_detector( #to allow for determination of actual eye movement
         baseline_filtered_samples=baseline_samples,
         movement_filtered_samples=movement_samples,
     )
 
+    #convert indexes into time
     peak_time = (
         peak_index
         / SAMPLE_RATE
     )
 
+    #where first meaningful movement began
     departure_time = (
         departure_index
         / SAMPLE_RATE
@@ -690,11 +712,11 @@ def collect_single_movement_trial(
         flush=True,
     )
 
-    print(
-        f"  baseline noise SD = "
-        f"{baseline_noise:.2f}\n",
-        flush=True,
-    )
+    # print(
+    #     f"  baseline noise SD = "
+    #     f"{baseline_noise:.2f}\n",
+    #     flush=True,
+    # )
 
     return {
         "signed_peak": signed_peak,
@@ -723,10 +745,13 @@ def collect_movement_calibration(
 ):
     """
     Collect several LEFT or RIGHT trials and aggregate them.
+    i.e All calibration trials for one direction
 
     A single trial's amplitude is noisy -- one unusually big or
-    small saccade would otherwise set the threshold for the whole
-    session. Taking the median signed peak and noise across several
+    small signal would set the threshold for the whole
+    session.
+     
+    Taking the median signed peak and noise across several
     trials makes the calibration much less sensitive to any one
     trial.
 
@@ -737,11 +762,11 @@ def collect_movement_calibration(
         list of per-trial result dicts (for debug plotting)
     """
 
-    trials = []
+    trials = [] #store all trials from same direction
 
-    for trial_number in range(1, num_trials + 1):
+    for trial_number in range(1, num_trials + 1): #repeat single-trial function
 
-        trial = collect_single_movement_trial(
+        trial = collect_single_movement_trial( #calls function to go through individual trials of each direction
             inlet=inlet,
             direction_name=direction_name,
             trial_number=trial_number,
@@ -749,11 +774,11 @@ def collect_movement_calibration(
             hp_filter=hp_filter,
         )
 
-        hp_filter = trial["hp_filter"]
+        hp_filter = trial["hp_filter"] #use new filter state for next trial (save)
 
-        trials.append(trial)
+        trials.append(trial)  # add trial results to list
 
-        if trial_number < num_trials:
+        if trial_number < num_trials: # between trials return eyes to center
 
             print(
                 "Return eyes to center.",
@@ -764,20 +789,24 @@ def collect_movement_calibration(
 
             drain_buffer(inlet)
 
+    #pull out each trial's peak
     signed_peaks = [
         trial["signed_peak"]
         for trial in trials
     ]
 
+    #pull out baseline noise values
     baseline_noises = [
         trial["baseline_noise"]
         for trial in trials
     ]
 
+    #take median across trials to get typical calibration value for live detection reference
     aggregated_signed_peak = float(
         np.median(signed_peaks)
     )
 
+    #same thing but for baseline noises to know differences between noise and actual movement
     aggregated_baseline_noise = float(
         np.median(baseline_noises)
     )
@@ -919,7 +948,7 @@ def calibrate(inlet):
     )
 
     print(
-        "BCI-MUSIC EYE CALIBRATION",
+        "MUSIC SELECTION EYE MOVEMENT CALIBRATION",
         flush=True,
     )
 
@@ -981,7 +1010,7 @@ def calibrate(inlet):
         _left_baseline_noise,
         hp_filter,
         left_trials,
-    ) = collect_movement_calibration(
+    ) = collect_movement_calibration( # record neutral, movement and then replay through detector
         inlet=inlet,
         direction_name="LEFT",
         hp_filter=hp_filter,
@@ -1022,18 +1051,21 @@ def calibrate(inlet):
     # BUILD DETECTION THRESHOLDS
     # ========================================================
 
+    #determine sign for left
     left_direction = (
         "positive"
         if left_peak >= 0
         else "negative"
     )
 
+    #determine sign for right
     right_direction = (
         "positive"
         if right_peak >= 0
         else "negative"
     )
 
+    #build live thresholds- only 65% of max peak calculated needed to activate
     left_threshold = float(
         abs(left_peak) * THRESHOLD_SCALE
     )
@@ -1104,7 +1136,7 @@ def calibrate(inlet):
     )
 
     # ========================================================
-    # SANITY CHECKS
+    # CHECK FOR CALIBRATION SIGN ERRORS
     # ========================================================
 
     if left_direction == right_direction:
@@ -1112,7 +1144,8 @@ def calibrate(inlet):
         print(
             "\nWARNING:"
             "\nLEFT and RIGHT produced the SAME "
-            "deflection direction.",
+            "deflection direction." \
+            "\nConsider re-calibrating",
             flush=True,
         )
 
@@ -1142,7 +1175,7 @@ def calibrate(inlet):
 
 
 # ============================================================
-# THRESHOLD CHECK
+# THRESHOLD CHECK FOR LIVE DETECTION
 # ============================================================
 
 def threshold_crossed(
@@ -1184,12 +1217,15 @@ def run_detector(
     Commands fire only when leaving NEUTRAL:
         NEUTRAL -> LEFT   sends LEFT
         NEUTRAL -> RIGHT  sends RIGHT
+        Back to Neutral -> nothing sent or measured here
 
     """
-        
-    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES)
-    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES)
 
+    # recreate two rolling buffers    
+    onset_buffer = deque(maxlen=ONSET_WINDOW_SAMPLES) #what is straight ahead currently
+    neutral_buffer = deque(maxlen=NEUTRAL_WINDOW_SAMPLES) #what is recent signal doing
+
+    # start in neutral, assume eyes in center
     gaze_state = GAZE_NEUTRAL
     samples_in_away_state = 0
     neutral_settle_counter = 0
@@ -1200,22 +1236,24 @@ def run_detector(
     )
 
     # --------------------------------------------------------
-    # Initial rolling neutral baseline.
+    # Initial rolling neutral baseline
     # --------------------------------------------------------
-    while len(neutral_buffer) < NEUTRAL_WINDOW_SAMPLES:
-        sample, _ = inlet.pull_sample(timeout=1.0)
 
+    #collect fresh live neutral baseline - fill buffer before detection begins
+    while len(neutral_buffer) < NEUTRAL_WINDOW_SAMPLES:
+        sample, _ = inlet.pull_sample(timeout=1.0) #pull sample
+  
         if sample is None:
             continue
 
-        b, a, zi = hp_filter
-        filtered, zi = lfilter(
+        b, a, zi = hp_filter    # unpack filter
+        filtered, zi = lfilter( # filter one EEG sample
             b,
             a,
             [sample[0]],
             zi=zi,
         )
-        hp_filter = (b, a, zi)
+        hp_filter = (b, a, zi) # store updated filter state
 
         neutral_buffer.append(filtered[0])
 
@@ -1286,7 +1324,7 @@ def run_detector(
 
         value = filtered[0]
 
-        signed_peak = streaming_onset_step(
+        signed_peak = streaming_onset_step( #same as during calibration
             value,
             onset_buffer,
             neutral_buffer,
@@ -1295,19 +1333,21 @@ def run_detector(
         if signed_peak is None:
             continue
 
+        # does this like calibrated LEFT
         left_crossed = threshold_crossed(
             signed_peak,
             calibration["left_direction"],
             calibration["left_threshold"],
         )
 
+        # is it calibrated RIGHT
         right_crossed = threshold_crossed(
             signed_peak,
             calibration["right_direction"],
             calibration["right_threshold"],
         )
 
-        # Defensive tie-break if both somehow cross.
+        # Defensive tie-break if both somehow cross - likely not used 
         if left_crossed and right_crossed:
             left_score = (
                 abs(signed_peak)
@@ -1326,38 +1366,38 @@ def run_detector(
         # ====================================================
         # NEUTRAL: only state that can emit a command.
         # ====================================================
-        if gaze_state == GAZE_NEUTRAL:
+        if gaze_state == GAZE_NEUTRAL: # only way detector will let another command happen
             if neutral_settle_counter > 0:
                 neutral_settle_counter -= 1
                 continue
 
-            if left_crossed:
+            if left_crossed: #if live signal matches left pattern from calibration
                 current_neutral = np.median(neutral_buffer)
 
                 print(
                     f"NEUTRAL -> LEFT | "
-                    f"peak={signed_peak:.2f} "
-                    f"(neutral={current_neutral:.2f})",
+                    f"peak={signed_peak:.2f})",
+                    # f"(neutral={current_neutral:.2f})",
                     flush=True,
                 )
 
                 control_outlet.push_sample(["LEFT"])
-                gaze_state = GAZE_LEFT
+                gaze_state = GAZE_LEFT # set new state and locks in even once back to neutral
                 samples_in_away_state = 0
                 continue
 
-            if right_crossed:
+            if right_crossed: #if live signal matches right pattern from calibration
                 current_neutral = np.median(neutral_buffer)
 
                 print(
                     f"NEUTRAL -> RIGHT | "
-                    f"peak={signed_peak:.2f} "
-                    f"(neutral={current_neutral:.2f})",
+                    f"peak={signed_peak:.2f})",
+                    # f"(neutral={current_neutral:.2f})",
                     flush=True,
                 )
 
                 control_outlet.push_sample(["RIGHT"])
-                gaze_state = GAZE_RIGHT
+                gaze_state = GAZE_RIGHT #new state
                 samples_in_away_state = 0
                 continue
 
@@ -1374,16 +1414,15 @@ def run_detector(
 
         if gaze_state == GAZE_LEFT:
 
-            samples_in_away_state += 1
+            samples_in_away_state += 1 # each sample counts time, detector ignores other detections 
 
-            if samples_in_away_state >= GAZE_HOLD_SAMPLES:
+            if samples_in_away_state >= GAZE_HOLD_SAMPLES: # go back to neutral after this time
 
                 print( "Back to NEUTRAL",
-                    # "LEFT -> NEUTRAL | "
-                    # "hold period complete",
                     flush=True,
                 )
 
+                #resets state
                 gaze_state = GAZE_NEUTRAL
                 samples_in_away_state = 0
 
@@ -1394,8 +1433,7 @@ def run_detector(
                 # Briefly allow the signal to settle once neutral.
                 neutral_settle_counter = RETURN_SETTLE_SAMPLES
 
-            # IMPORTANT:
-            # Ignore right_crossed, left_crossed, and all other
+            # this ignores right_crossed, left_crossed, and all other
             # detections while we are in the LEFT state.
             continue
 
@@ -1438,8 +1476,8 @@ def main():
     """
     Full program order:
 
-        1. Start BCI_Controls output stream.
-        2. Find IDUN EEG stream.
+        1. Start idun_pipe.exe.
+        2. Find IDUN EEG stream using by starting this script.
         3. Calibrate LEFT / RIGHT (multiple trials each).
         4. Start continuous live detector.
     """
