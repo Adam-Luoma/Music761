@@ -24,8 +24,8 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 #  CONFIG — edit these to match your setup
 # ─────────────────────────────────────────────
-CHECKPOINT_DIR   = r"C:\Users\179is\BCI-Music Project\Music761\ARIA\Checkpoints\model" #FIND PATH
-OUTPUT_DIR       = r"C:\Users\179is\BCI-Music Project\Music761\ARIA\Generated_Melodies" #MAKE PATH
+CHECKPOINT_DIR   = r"C:/Users/adamc/MusicGenAI/melody_rnn_finetuned/ABBA_05_03_26/melody_rnn/logdir/run1" #FIND PATH
+OUTPUT_DIR       = r"" #MAKE PATH
 HPARAMS          = "batch_size=64,rnn_layer_sizes=[64,64]"
 NUM_STEPS_R1     = 128        # ~20 seconds at 120bpm, 4/4
 NUM_STEPS_R2     = 256        # ~20 seconds at 120bpm, 4/4
