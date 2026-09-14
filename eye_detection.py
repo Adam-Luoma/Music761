@@ -26,6 +26,16 @@ from scipy.signal import butter, lfilter, lfilter_zi
 
 EEG_STREAM_TYPE = "EEG"
 
+#for calibration to be displayed on frontend
+CALIBRATION_STREAM_NAME = "Calibration_Stream"
+CALIBRATION_STREAM_TYPE= "Markers"
+CALIBRATION_SOURCE_ID = "bci_music_calibration_status"
+
+#so frontend is in synch with calibration
+CALIBRATION_COMMAND_STREAM_NAME = "Calibration_Commands"
+CALIBRATION_COMMAND_STREAM_TYPE = "Markers"
+
+#for sending L/R commands to frontend
 CONTROL_STREAM_NAME = "IDUN_Stream"
 CONTROL_STREAM_TYPE = "Markers"
 CONTROL_SOURCE_ID = "bci_music_eye_controls"
@@ -45,16 +55,13 @@ BASELINE_SECONDS = 10.0              # straight-ahead baseline
 MOVEMENT_RECORDING_SECONDS = 10.0    # gives user time to react
 
 # How many LEFT / RIGHT trials to collect and average during calibration.
-CALIBRATION_TRIALS_PER_DIRECTION = 3 #can change
+CALIBRATION_TRIALS_PER_DIRECTION = 1 #can change
 
 # Original detector threshold settings.
 THRESHOLD_SCALE = 0.65
 
-# 1 second cooldown at 250 Hz.
-COOLDOWN_SAMPLES = 250
-
 NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
-PLOT_CALIBRATION_DEBUG = True  # show calibration diagnostic plots, set to false for faster 
+PLOT_CALIBRATION_DEBUG = False # show calibration diagnostic plots, set to false for faster 
 
 # ============================================================
 # GAZE STATE MACHINE SETTINGS
@@ -126,6 +133,75 @@ def find_eeg_inlet(wait_time=5.0):
     )
 
     return StreamInlet(stream)
+
+
+# ============================================================
+# CREATE OUTPUT CALIBRATION STREAM
+# ============================================================
+def create_calibration_status_outlet():
+    """ 
+    Create an LSL marker stream that sends calibration status
+    updates to frontend.py applicaton.
+    
+    """
+    info = StreamInfo(
+        CALIBRATION_STREAM_NAME,
+        CALIBRATION_STREAM_TYPE,
+        1,
+        0,
+        "string",
+        CALIBRATION_SOURCE_ID,
+    )
+    return StreamOutlet(info)
+
+def wait_for_frontend_ready(wait_time=1.0):
+    """
+    Wait until the frontend connects and sends READY.
+    Calibration will not start until then.
+    """
+
+    print("Waiting for frontend...", flush=True)
+
+    while True:
+
+        streams = resolve_streams(wait_time=wait_time)
+
+        command_streams = [
+            s for s in streams
+            if (
+                s.name() == CALIBRATION_COMMAND_STREAM_NAME
+                and s.type() == CALIBRATION_COMMAND_STREAM_TYPE
+            )
+        ]
+
+        if not command_streams:
+            continue
+
+        command_inlet = StreamInlet(command_streams[0])
+
+        print(
+            "Calibration command stream found. "
+            "Waiting for READY...",
+            flush=True,
+        )
+
+        while True:
+
+            sample, _ = command_inlet.pull_sample(timeout=1.0)
+
+            if sample is None:
+                continue
+
+            command = sample[0]
+
+            if command == "READY":
+
+                print(
+                    "Frontend ready. Starting calibration.\n",
+                    flush=True,
+                )
+
+                return
 
 
 # ============================================================
@@ -551,7 +627,8 @@ def collect_single_movement_trial(
     direction_name, # L or R
     trial_number, # which trial we are on
     total_trials, 
-    hp_filter, 
+    hp_filter,
+    status_outlet,  #for calibration status update to frontend.py 
 ):
     """
     Collect ONE LEFT or RIGHT movement trial.
@@ -585,6 +662,12 @@ def collect_single_movement_trial(
         flush=True,
     )
 
+
+    status_outlet.push_sample([
+        f"CALIBRATION_{direction_name}_TRIAL_{trial_number}"
+    ])
+
+
     # ========================================================
     # 1. USER STARTS FROM STRAIGHT AHEAD
     # ========================================================
@@ -593,6 +676,10 @@ def collect_single_movement_trial(
         "\nFirst, look STRAIGHT AHEAD.",
         flush=True,
     )
+
+    status_outlet.push_sample([
+        f"STRAIGHT|{direction_name}|{trial_number}|{total_trials}"
+    ])
 
     countdown(3)
 
@@ -603,6 +690,7 @@ def collect_single_movement_trial(
         flush=True,
     )
 
+
     # decide how many baseline samples to record
     #converts samples into seconds
     baseline_num_samples = int(
@@ -610,6 +698,8 @@ def collect_single_movement_trial(
         * SAMPLE_RATE
     )
 
+    status_outlet.push_sample(["MEASURING_BASELINE"])
+    
     #collect samples- raw eeg values, hp filtered eeg values, and updated filter state
     baseline_raw_samples, baseline_samples, hp_filter = (
         collect_filtered_samples(
@@ -639,6 +729,9 @@ def collect_single_movement_trial(
         flush=True,
     )
 
+    status_outlet.push_sample([
+        f"BASELINE_COMPLETE|{direction_name}|{trial_number}|{total_trials}"])
+
     # ========================================================
     # 2. GIVE MOVEMENT CUE
     # ========================================================
@@ -647,6 +740,8 @@ def collect_single_movement_trial(
         f"\nLOOK {direction_name} NOW!",
         flush=True,
     )
+
+    status_outlet.push_sample([f"LOOK_{direction_name}"])
 
     # ========================================================
     # 3. RECORD LONG ENOUGH FOR NATURAL REACTION
@@ -670,8 +765,11 @@ def collect_single_movement_trial(
     # 4. REPLAY THIS TRIAL THROUGH THE SAME STREAMING DETECTOR
     #    THAT LIVE DETECTION USES 
     # ========================================================
+    status_outlet.push_sample(["PROCESSING"])
+
     #the peak measured here is the peak live detection will actually compute for
     # this movement, not an idealized offline estimate
+    
     (
         signed_peak,
         peak_index,
@@ -712,11 +810,11 @@ def collect_single_movement_trial(
         flush=True,
     )
 
-    # print(
-    #     f"  baseline noise SD = "
-    #     f"{baseline_noise:.2f}\n",
-    #     flush=True,
-    # )
+    print(
+        f"  baseline noise SD = "
+        f"{baseline_noise:.2f}\n",
+        flush=True,
+    )
 
     return {
         "signed_peak": signed_peak,
@@ -741,6 +839,7 @@ def collect_movement_calibration(
     inlet,
     direction_name,
     hp_filter,
+    status_outlet,
     num_trials=CALIBRATION_TRIALS_PER_DIRECTION,
 ):
     """
@@ -772,6 +871,7 @@ def collect_movement_calibration(
             trial_number=trial_number,
             total_trials=num_trials,
             hp_filter=hp_filter,
+            status_outlet = status_outlet,
         )
 
         hp_filter = trial["hp_filter"] #use new filter state for next trial (save)
@@ -927,7 +1027,7 @@ def plot_calibration_debug(
 # FULL CALIBRATION
 # ============================================================
 
-def calibrate(inlet):
+def calibrate(inlet, status_outlet):
     """
     Calibration order:
 
@@ -983,7 +1083,11 @@ def calibrate(inlet):
         flush=True,
     )
 
+    status_outlet.push_sample(["CALIBRATION_START"])
+
     hp_filter = make_highpass_filter()
+
+    status_outlet.push_sample(["PREPARING"])
 
     print(
         "Warming up filter...",
@@ -1014,6 +1118,7 @@ def calibrate(inlet):
         inlet=inlet,
         direction_name="LEFT",
         hp_filter=hp_filter,
+        status_outlet=status_outlet,
     )
 
     print(
@@ -1038,6 +1143,7 @@ def calibrate(inlet):
         inlet=inlet,
         direction_name="RIGHT",
         hp_filter=hp_filter,
+        status_outlet=status_outlet,
     )
 
     if PLOT_CALIBRATION_DEBUG:
@@ -1167,6 +1273,8 @@ def calibrate(inlet):
         "left_threshold": left_threshold,
         "right_threshold": right_threshold,
     }
+
+    status_outlet.push_sample(["CALIBRATION_COMPLETE"])
 
     return (
         calibration,
@@ -1477,7 +1585,7 @@ def main():
     Full program order:
 
         1. Start idun_pipe.exe.
-        2. Find IDUN EEG stream using by starting this script.
+        2. Find IDUN EEG stream by starting this script.
         3. Calibrate LEFT / RIGHT (multiple trials each).
         4. Start continuous live detector.
     """
@@ -1486,13 +1594,18 @@ def main():
         create_control_outlet()
     )
 
+    calibration_status_outlet = create_calibration_status_outlet()
 
     inlet = find_eeg_inlet(
         wait_time=5.0
     )
 
+    wait_for_frontend_ready()
+
     calibration, hp_filter = (
-        calibrate(inlet)
+        calibrate(
+        inlet, 
+        calibration_status_outlet)
     )
 
     run_detector(

@@ -16,7 +16,9 @@ Controls:
   ESC         — quit
 """
 
-from pylsl import StreamInlet, resolve_streams
+from tkinter.tix import TEXT
+
+from pylsl import StreamInfo, StreamInlet, StreamOutlet, resolve_streams
 import pygame
 import pygame.midi
 import subprocess
@@ -562,6 +564,44 @@ def right_move(state, midi):
 CONTROL_STREAM_NAME = "IDUN_Stream"
 CONTROL_STREAM_TYPE = "Markers"
 
+CALIBRATION_COMMAND_STREAM_NAME = "Calibration_Commands"
+CALIBRATION_COMMAND_STREAM_TYPE = "Markers"
+CALIBRATION_COMMAND_SOURCE_ID = "bci_music_calibration_commands"
+
+CALIBRATION_STREAM_NAME = "Calibration_Stream"
+CALIBRATION_STREAM_TYPE = "Markers"
+
+
+def connect_to_calibration_stream(wait_time=10.0):
+    streams = resolve_streams(wait_time=wait_time)
+
+    for stream in streams:
+        if (
+            stream.name() == CALIBRATION_STREAM_NAME
+            and stream.type() == CALIBRATION_STREAM_TYPE
+        ):
+            return StreamInlet(stream)
+
+    raise RuntimeError(
+        "Could not find calibration status stream."
+    )
+
+def create_calibration_command_outlet():
+    """
+    Create a small LSL stream that lets the frontend
+    tell the backend when the GUI is ready.
+    """
+
+    info = StreamInfo(
+        CALIBRATION_COMMAND_STREAM_NAME,
+        CALIBRATION_COMMAND_STREAM_TYPE,
+        1,
+        0,
+        "string",
+        CALIBRATION_COMMAND_SOURCE_ID,
+    )
+
+    return StreamOutlet(info)
 
 def connect_to_control_stream(wait_time=10.0):
     """
@@ -589,18 +629,73 @@ def connect_to_control_stream(wait_time=10.0):
         f"Available streams: {available}"
     )
 
+def draw_calibration_arrow(screen, direction, center_x, center_y):
+    """
+    Draw a large LEFT or RIGHT arrow.
+    """
+
+    arrow_length = 180
+    arrow_height = 70
+    head_size = 45
+
+    if direction == "LEFT":
+        points = [
+            (center_x - arrow_length // 2, center_y),
+            (center_x - arrow_length // 2 + head_size, center_y - arrow_height // 2),
+            (center_x - arrow_length // 2 + head_size, center_y - 15),
+            (center_x + arrow_length // 2, center_y - 15),
+            (center_x + arrow_length // 2, center_y + 15),
+            (center_x - arrow_length // 2 + head_size, center_y + 15),
+            (center_x - arrow_length // 2 + head_size, center_y + arrow_height // 2),
+        ]
+
+    elif direction == "RIGHT":
+        points = [
+            (center_x + arrow_length // 2, center_y),
+            (center_x + arrow_length // 2 - head_size, center_y - arrow_height // 2),
+            (center_x + arrow_length // 2 - head_size, center_y - 15),
+            (center_x - arrow_length // 2, center_y - 15),
+            (center_x - arrow_length // 2, center_y + 15),
+            (center_x + arrow_length // 2 - head_size, center_y + 15),
+            (center_x + arrow_length // 2 - head_size, center_y + arrow_height // 2),
+        ]
+
+    else:
+        return
+
+    pygame.draw.polygon(
+        screen,
+        WHITE,   # change this to whichever color variable you want
+        points,
+    )
 
 # ─────────────────────────────────────────────
 #  MAIN GAME
 # ─────────────────────────────────────────────
 
 def main():
-    control_inlet = connect_to_control_stream(wait_time=10.0) # wait 10 secs to connect to stream
+    # control_inlet = connect_to_control_stream(wait_time=10.0) # wait 10 secs to connect to stream
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption("AI Melody Composer — ABABCB")
     clock = pygame.time.Clock()
+
+    calibration_command_outlet = (
+        create_calibration_command_outlet()
+        )
+
+    control_inlet = connect_to_control_stream(
+        wait_time=10.0
+        ) # wait 10 secs to connect to stream
+
+    calibration_inlet = connect_to_calibration_stream(
+        wait_time=10.0
+        ) # wait 10 secs to connect to stream
+
+    calibration_command_outlet.push_sample(
+        ["READY"]
+    )
 
     # Fonts
     try:
@@ -628,6 +723,15 @@ def main():
     feedback_msg = ""
     feedback_timer = 0
     final_screen = False
+
+    calibration_active = True
+
+    calibration_instruction = "Preparing calibration..."
+    calibration_direction = ""
+    calibration_trial = 0
+    calibration_total_trials = 0
+
+    game_started = False
 
 
     def start_generation():
@@ -724,7 +828,7 @@ def main():
                 midi.play(state.options[idx].notes)
 
     # Kick off first generation
-    start_generation()
+    #start_generation()
 
     running = True
     while running:
@@ -733,6 +837,54 @@ def main():
         spinner_t += dt
         if feedback_timer > 0:
             feedback_timer -= 1
+
+        # ── CALIBRATION STATUS ──────────────────────
+        while True:
+            calibration_sample, _ = calibration_inlet.pull_sample(
+                timeout=0.0
+            )
+
+            if calibration_sample is None:
+                break
+
+            message = calibration_sample[0]
+
+            if message == "CALIBRATION_START":
+                calibration_active = True
+                calibration_instruction = "Calibration starting..."
+
+            elif message == "PREPARING":
+                calibration_instruction = "Preparing calibration..."
+
+            elif message.startswith("STRAIGHT|"):
+                parts = message.split("|")
+
+                calibration_direction = parts[1]
+                calibration_trial = int(parts[2])
+                calibration_total_trials = int(parts[3])
+
+                calibration_instruction = "Look straight ahead"
+
+            elif message == "MEASURING_BASELINE":
+                calibration_instruction = "Keep looking straight ahead"
+
+            elif message == "LOOK_LEFT":
+                calibration_instruction = "LOOK LEFT"
+
+            elif message == "LOOK_RIGHT":
+                calibration_instruction = "LOOK RIGHT"
+
+            elif message == "PROCESSING":
+                calibration_instruction = "Processing..." 
+                "\nLook straight ahead normally again."
+
+            elif message == "CALIBRATION_COMPLETE":
+                calibration_instruction = "Calibration complete!"
+                calibration_active = False
+
+                if not game_started:
+                    start_generation()
+                    game_started = True
 
         # ── Eye movement controls ────────────────────────────
         # Read every queued LEFT/RIGHT command without blocking the GUI.
@@ -804,7 +956,69 @@ def main():
         for gy in range(0, H, 60):
             pygame.draw.line(screen, (18, 20, 32), (0, gy), (W, gy))
 
-        if final_screen:
+        if calibration_active:
+
+            title = font_lg.render(
+                "Eye Movement Calibration",
+                True,
+                WHITE
+            )
+
+            screen.blit(
+                title,
+                (
+                    W // 2 - title.get_width() // 2,
+                    80
+                )
+            )
+
+            instruction = font_lg.render(
+                calibration_instruction,
+                True,
+                WHITE
+            )
+
+            screen.blit(
+                instruction,
+                (
+                    W // 2 - instruction.get_width() // 2,
+                    H // 2
+                )
+            )
+            if calibration_instruction == "LOOK LEFT":
+                draw_calibration_arrow(
+                    screen,
+                    "LEFT",
+                    W // 2,
+                    H // 2 + 100,
+                )
+
+            elif calibration_instruction == "LOOK RIGHT":
+                draw_calibration_arrow(
+                    screen,
+                    "RIGHT",
+                    W // 2,
+                    H // 2 + 100,
+                )
+            if calibration_total_trials > 0:
+
+                trial_text = font_sm.render(
+                    f"{calibration_direction} — "
+                    f"Trial {calibration_trial} of "
+                    f"{calibration_total_trials}",
+                    True,
+                    GREY
+                )
+
+                screen.blit(
+                    trial_text,
+                    (
+                        W // 2 - trial_text.get_width() // 2,
+                        H - 100
+                    )
+                )
+
+        elif final_screen:
             # ── DONE SCREEN ──
             draw_roundrect(screen, PANEL_BG, (100, 80, W-200, H-160), radius=20)
             draw_roundrect(screen, (0,0,0,0), (100, 80, W-200, H-160), radius=20,
