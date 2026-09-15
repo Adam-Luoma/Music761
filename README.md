@@ -1,4 +1,39 @@
-Music761 File Notes
+# IDUN IN-EAR MELODY SELCTION
+
+## Overview
+
+This progam allows the user to create a melody/song using only the movement of their eyes. To listen to one melody or the other, the user can look left or right. To select a melody as their choice, they must look in the same direction twice in a row.
+
+## Project Structure
+
+`idun_pipe.exe`
+- runs separately through `run.cmd` within the `idun_pipe` application given
+- establishes LSL connection with headset 
+
+`eye_detection.py` 
+
+- backend of this project
+- controls signal processing, threshold calibration, and eye-movement detection
+
+`frontend.py`
+
+- frontend of this project and GUI display
+- displays calibration instructions
+- plays generated meoldy options and LEFT/RIGHT choices controlled by eye movements
+
+#### The pipeline should run as follows:
+
+`idun_pipe.exe` -> `eye_detection.py` -> `frontend.py`
+
+`eye_detection.py` will not begin calibration until `frontend.py` starts running.
+
+### Next steps:
+
+- Clean up GUI for calibration and actual music playing/selection
+- Create executable for everything to run together
+
+____________________________________________________________________________________________________________________
+## Music761 File Notes
 
 ARIA > folder containing last model checkpoints on ABBA train set (for use in the application)
 
