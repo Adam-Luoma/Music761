@@ -1,8 +1,8 @@
 """
 BCI-Music Eye Movement Threshold Detector
 --------------------------------------
-The detector responds to the CHANGE into an eye movement,
-rather than a gaze that is already being held.
+- responds to the CHANGE into an eye movement,
+- works as backend to frontend.py and alongside idun_pipe.exe for headset connection
 
 """
 
@@ -24,6 +24,8 @@ from scipy.signal import butter, lfilter, lfilter_zi
 # STREAM SETTINGS
 # ============================================================
 
+
+#using different states for different streams in connection with frontend
 EEG_STREAM_TYPE = "EEG"
 
 #for calibration to be displayed on frontend
@@ -57,11 +59,11 @@ MOVEMENT_RECORDING_SECONDS = 10.0    # gives user time to react
 # How many LEFT / RIGHT trials to collect and average during calibration.
 CALIBRATION_TRIALS_PER_DIRECTION = 1 #can change
 
-# Original detector threshold settings.
+# Original detector threshold settings - can change.
 THRESHOLD_SCALE = 0.65
 
 NEUTRAL_WINDOW_SAMPLES = 500  # 2 seconds of neutral signal for baseline noise
-PLOT_CALIBRATION_DEBUG = False # show calibration diagnostic plots, set to false for faster 
+PLOT_CALIBRATION_DEBUG = False # show calibration diagnostic plots when debugging
 
 # ============================================================
 # GAZE STATE MACHINE SETTINGS
