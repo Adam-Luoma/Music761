@@ -1,10 +1,10 @@
-# IDUN IN-EAR MELODY SELCTION
+## IDUN IN-EAR MELODY SELECTION
 
-## Overview
+### Overview
 
 This progam allows the user to create a melody/song using only the movement of their eyes. To listen to one melody or the other, the user can look left or right. To select a melody as their choice, they must look in the same direction twice in a row.
 
-## Project Structure
+### Project Structure
 
 `idun_pipe.exe`
 - runs separately through `run.cmd` within the `idun_pipe` application given
@@ -19,7 +19,7 @@ This progam allows the user to create a melody/song using only the movement of t
 
 - frontend of this project and GUI display
 - displays calibration instructions
-- plays generated meoldy options and LEFT/RIGHT choices controlled by eye movements
+- plays generated melody options and LEFT/RIGHT choices controlled by eye movements
 
 #### The pipeline should run as follows:
 
